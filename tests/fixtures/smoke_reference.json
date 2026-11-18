@@ -1,0 +1,80 @@
+{
+  "device_info": {
+    "device": "cpu",
+    "name": "cpu",
+    "torch": "2.15.0",
+    "memory": null
+  },
+  "tier": "smoke",
+  "stages": {
+    "1_geometry": {
+      "status": "ok",
+      "n_links": 102,
+      "solid_cells": 78,
+      "mask_symmetric": false,
+      "q_min": 0.009999999776482582,
+      "q_max": 1.0,
+      "wall_s": 0.02476570798899047
+    },
+    "2_lbm_forward": {
+      "status": "ok",
+      "cd": 2.5352256298065186,
+      "cl": -5.364417575037805e-06,
+      "wall_s": 4.343661457998678
+    },
+    "3_adjoint_step": {
+      "status": "ok",
+      "cd_before": 2.5352256298065186,
+      "cd_after": 2.3517472743988037,
+      "grad_norm": 3.2227580547332764,
+      "wall_s": 124.05145625001751
+    },
+    "4_dataset": {
+      "status": "ok",
+      "n_shapes": 3,
+      "n_points": 2000,
+      "cd": [
+        2.6003987789154053,
+        0.9612142443656921,
+        1.333866000175476
+      ],
+      "wall_s": 6.493323415983468
+    },
+    "5_pinn_train": {
+      "status": "ok",
+      "mlp_first_loss": 14.246594429016113,
+      "mlp_final_loss": 13.607906341552734,
+      "mlp_train_s": 128.49417262498173,
+      "transformer_first_loss": 14.702146530151367,
+      "transformer_final_loss": 14.23361873626709,
+      "transformer_train_s": 173.3611735829909,
+      "wall_s": 302.4985167499981
+    },
+    "6_stress_integrator": {
+      "status": "ok",
+      "mlp_cd": -0.025605861097574234,
+      "mlp_cl": -0.0026928142178803682,
+      "transformer_cd": -0.011734582483768463,
+      "transformer_cl": -0.0027534218970686197,
+      "wall_s": 0.7839396669878624
+    },
+    "7_diffusion": {
+      "status": "ok",
+      "loss_first": 0.832177460193634,
+      "loss_last": 0.26558396220207214,
+      "valid_of_4": 3,
+      "J_guided": 1.9725186575669795e-05,
+      "J_unguided": 1.9872295524692163e-05,
+      "guided_le_unguided": true,
+      "wall_s": 40.189260874991305
+    },
+    "8_benchmark": {
+      "status": "ok",
+      "rows": 3,
+      "adjoint_cd_first": 2.5352585576121327,
+      "adjoint_cd_final": 2.3829226504893977,
+      "wall_s": 266.3764579159906
+    }
+  },
+  "total_wall_s": 744.7613820399565
+}

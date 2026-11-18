@@ -1,0 +1,7 @@
+# Test Case 2: circle -> RAE2822, cambered (D = 16), Re 1000, CL held at the RAE2822 LBM CL (G19, G20).
+# adjoint.impl = vjp: the hand transpose supports BGK + fixed outlet only.
+case: {re: 1000, aoa: 0, start: circle, target: rae2822, t_min: rae2822, cl_ref: "rae2822@lbm"}
+geometry: {mode: cambered, k: 8}
+lbm: {collision: trt, outlet: extrapolate, sponge: {enabled: true}, perturb: 0.1, trt_magic: 0.001}  # F1: Lambda 3/16 blows up at tau ~ 0.504 (see d2q9 tests)
+adjoint: {mode: time_averaged, impl: vjp}
+optimizer: {g_cap: 0.01}

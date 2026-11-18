@@ -1,0 +1,6 @@
+# Test Case 1: circle -> NACA0012-like, symmetric, no lift constraint, steady adjoint (G3, G20).
+case: {re: 20, aoa: 0, start: circle, target: naca0012, t_min: naca0012, cl_ref: null}
+geometry: {mode: symmetric, k: 8}
+adjoint: {mode: steady}
+optimizer: {g_cap: 0.02}
+diffusion: {guide_scale: 3.0, cfg_scale: 0.0}  # WP 17 best valid pair (G36)

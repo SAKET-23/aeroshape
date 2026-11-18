@@ -1,0 +1,14 @@
+# Gate 1 cylinder validation (scripts/01_validate_lbm_cylinder.py). lbm.* keys override base.yaml.
+validate:
+  re: [20, 40, 100]
+  n_steps: null           # null = run() default budget; set small for smoke tests
+  grid_N: [10, 20, 40]    # --grid-convergence at Re 20
+  snapshot_t: [30, 35, 60]  # Re 100 vorticity snapshots, convective times
+  # Gate 2a (--adjoint-check): symmetric NURBS circle fit, adjoint vs central FD of the same solver
+  adjoint_k: 41
+  adjoint_N: 20           # dev: 20 x 10 domain, offset 5 (G26: blockage irrelevant for adjoint-vs-FD)
+  adjoint_delta: 1.0e-4   # FD step, chord units
+  adjoint_steady_tol: 1.0e-13   # tight so FD noise << signal
+  adjoint_max_convective_times: 300
+  noise_points: 5         # points re-differenced at delta/2 for the FD-noise estimate
+  adjoint_pass: 2.0e-3

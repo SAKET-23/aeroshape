@@ -1,0 +1,10 @@
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+data/
+runs/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pt
+!tests/fixtures/**

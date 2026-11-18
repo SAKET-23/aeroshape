@@ -1,0 +1,8 @@
+lbm: {cells_per_d: 40, cells_per_d_high_re: 100, max_convective_times: 100}
+adjoint: {horizon_convective_times: 20}
+pinn: {d_model: 128}
+sampling: {n_collocation: 8000, near_frac: 0.5, near_dist: 0.3}
+train: {shapes_per_step: 16, adam_steps: 20000, lbfgs_steps: 1000}
+dataset: {n_shapes: 30, points_per_shape: 50000}
+diffusion: {n_shapes: 5000, steps: 50000}
+optimizer: {max_cycles: 30}

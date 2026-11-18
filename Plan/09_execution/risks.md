@@ -1,0 +1,20 @@
+# Risks
+
+Ordered by likelihood × impact. Each has an early warning sign, a mitigation built into the plan, and a fallback if the mitigation fails.
+
+| # | Risk | Likelihood | Impact | Early sign | Mitigation | Fallback |
+|---|---|---|---|---|---|---|
+| R1 | PINN cannot reach useful accuracy on time-averaged Re 1000 flow (G10) | High | Medium (cases 2–3 for methods 2–4) | v2 holdout velocity error > 10% after dev training | v1/v2 staging; learned forcing term; data-dominant loss; gate only on v1 | For cases 2–3, methods 2–3 use the PINN gradient but LBM line search (hybrid mode, reported separately); or report the gap honestly |
+| R2 | Time-averaged steady adjoint diverges or gives a poor direction at Re 1000 | Medium | High (method 1 on cases 2–3) | `‖F*‖` grows > 10× per convective time; backtracking rejects steps | Fixed horizon (report's 20 convective times); small `g_cap` steps; backtracking | Short-window unsteady adjoint by autograd (VJP through time) on a coarse grid with checkpointing, or FD gradient on a reduced `k` |
+| R3 | Dev-tier grids miss Gate 1's 2% (esp. Re 100) | Medium | Medium | Grid-convergence plot still trending at N = 20 | Report convergence; TRT; sponge | Pass Gate 1 at full tier on cloud CUDA |
+| R4 | MPS missing ops or wrong results for higher-order autograd through attention | Medium | Medium | WP 13 MPS check fails | Explicit attention implementation | Train PINNs on CPU (small models) or cloud CUDA; MPS still used for LBM |
+| R5 | LBM throughput on MPS far below estimate (kernel-launch bound) | Medium | Medium (dev-tier wall-clock) | WP 4 benchmark < 30 MLUPS | Fused streaming, `no_grad`, larger grids amortize launches | Move dataset v2 and cases 2–3 to cloud CUDA earlier |
+| R6 | Link-topology jumps make the optimizer stall or zig-zag | Medium | Medium | CD non-monotone with large `eta`; many backtracks | Step cap `g_cap`, backtracking, warm start | Smooth the drag by averaging the gradient over 2 sub-cell grid offsets |
+| R7 | Optimizer converges to shapes far from NACA0012 / RAE2822 | Medium | Low | Distance to reference stays > 0.02 chord | Constraints as in the report; t_min from the target airfoil | Report drag reduction and constraint satisfaction as success (the report notes optimum depends on constraints) |
+| R8 | "< 2 ms" or "> 1000×" not achieved | Medium | Low | WP 15 latency numbers | Geometry-token caching, batched queries, `torch.compile` on CUDA | Report measured numbers only (G17) |
+| R9 | Diffusion samples invalid or ignore the condition | Low–Medium | Medium | Validity < 90%, guidance sweep flat | Standardization, condition dropout tuned, guidance through `z0_hat`, projection step | Use diffusion only as an initializer for the PINN optimizer (reported as a variant) |
+| R10 | float32 GPU adjoint inaccurate | Low | Medium | WP 7 level 6 cosine < 0.999 | Validation in float64 on CPU | Run the adjoint on CPU for gradient-critical runs |
+| R11 | Cloud sessions interrupt long jobs | Medium | Low | — | Resumable scripts, Drive-mounted outputs | Shard work into smaller jobs |
+| R12 | RAE2822 fit needs large `k`, making diffusion/PINN harder | Low | Low | WP 2 fit report | Choose smallest `k` meeting 2e-3 chord | Accept 5e-3 chord fit error and note it |
+| R14 | TRT with Λ = 0.001 (G28) loses the Λ = 3/16 property of exact straight-wall placement, so wall-position accuracy at Re 1000 may degrade | Medium | Low–Medium | Re 1000 NACA0012 CD vs the report's ≈ 0.12 at AoA 0 | Compare CD at N = 48 with Λ = 0.001 against BGK at the same tau (BGK was stable for 40 T) | Use BGK at Re 1000 if it agrees and stays stable **Checked 2026-11-18 (NACA0012, Re 1000, AoA 0, N = 48, MPS, tau 0.5083):** TRT Λ = 0.001 CD 0.1231 vs BGK 0.1232 (report ≈ 0.12); both stable, same period (415 steps). BGK is acceptable at Re 1000; tested on this one shape only |
+| R13 | Memory pressure on 24 GB for PINN third derivatives | Low | Low | MPS OOM / swap during WP 15 | Micro-batching with gradient accumulation | Fewer collocation points per shape |

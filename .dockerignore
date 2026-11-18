@@ -1,0 +1,13 @@
+.git/
+.venv/
+.trail/
+.claude/
+graft/
+data/
+runs/
+docs/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pt
+!tests/fixtures/**
