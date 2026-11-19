@@ -224,7 +224,7 @@ def generate(a, cfg, device, dtype):
                     cl_rms=res["cl_rms"], mode_used=res["mode_used"], window_ct=res["window_ct"], cl_hist=res.get("cl_hist"), device=str(device))
         d = dict(alpha=alphas[i - base].float().cpu(), mode="cambered" if v2 else "symmetric", re=torch.tensor(float(re)), aoa=torch.tensor(float(aoa)),
                  cd=torch.tensor(res["cd"]), cl=torch.tensor(res["cl"]),
-                 split=torch.tensor(int(i >= first_holdout), dtype=torch.int8), kind=torch.tensor(0, dtype=torch.int8),
+                 split=torch.tensor(int(i >= first_holdout), dtype=torch.int8), kind=torch.tensor(int(v2), dtype=torch.int8),  # 1 = time-averaged
                  meta=meta, **pts)
         tmp = path.with_suffix(".tmp")
         save_ckpt(tmp, d, str(device))

@@ -6,6 +6,7 @@ import torch
 
 from aeroshape.core.types import Boundary, FlowFields
 from aeroshape.pinn.embeddings import predict_flow
+from aeroshape.pinn.mixing import sym_grad
 from aeroshape.pinn.stress_integrator import surface_forces
 
 Tensor = torch.Tensor
@@ -97,8 +98,12 @@ def hybrid_loss(model, nurbs, batch: TrainBatch, cfg, step: int, log: bool = Fal
         force_data = ((cd - b.cd) ** 2 + (cl - b.cl) ** 2).mean()
         if L.w_grad > 0:  # G30: shape sensitivities against the adjoint-LBM gradients on the free entries
             free = nurbs.free_idx
-            grad_data = sum(w * _grad_mismatch(torch.autograd.grad(f.sum(), alpha, create_graph=True)[0][:, free], ga[:, free])
-                            for f, ga, w in ((cd, b.gcd, 1.0), (cl, b.gcl, 0.5)))
+
+            def gp(f):
+                g = torch.autograd.grad(f.sum(), alpha, create_graph=True)[0]
+                # shortcut: in cambered layout the references are the symmetric steady-run gradients (first k columns), so project; true cambered adjoints need a new branch
+                return torch.cat([sym_grad(g), torch.zeros_like(g[:, g.shape[1] // 2:])], 1) if nurbs.mode == "cambered" else g
+            grad_data = sum(w * _grad_mismatch(gp(f)[:, free], ga[:, free]) for f, ga, w in ((cd, b.gcd, 1.0), (cl, b.gcl, 0.5)))
 
     wall, edge, pin, data = wall.mean(), edge.mean(), pin.mean(), (w_data_b * data).mean() / L.w_data
     total = wp * pde + L.w_wall * wall + L.w_edge * edge + L.w_pin * pin + L.w_data * data + (L.w_force * force if v2 else 0) + (L.w_cd * force_data if L.w_cd > 0 else 0) + L.w_grad * grad_data

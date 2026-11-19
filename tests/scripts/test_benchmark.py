@@ -13,9 +13,9 @@ HAVE_MODELS = (ROOT / "runs/pinn_selected.json").exists() and (ROOT / "runs/diff
 MICRO = ["optimizer.max_cycles=1", "adjoint.tol=1.0e-3", "lbm.max_convective_times=3", "diffusion.sample_steps=4"]
 
 
-def test_cases_2_3_fail_clearly_without_v2_models():
+def test_cases_2_3_fail_clearly_until_wired():
     ns = bench.argparse.Namespace(diffusion_ckpt="runs/diffusion_dev/ckpt/diffusion.pt")
-    with pytest.raises(SystemExit, match="PINN v2"):
+    with pytest.raises(SystemExit, match=r"needs PINN v2|v2 models are listed"):
         bench.models_for(2, ns)
 
 

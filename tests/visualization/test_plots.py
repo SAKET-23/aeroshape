@@ -25,3 +25,15 @@ def test_adjoint_plots(tmp_path):
     F = torch.rand(9, 20, 40)
     plots.plot_adjoint_field(F, torch.zeros(20, 40, dtype=torch.bool), tmp_path / "f.png")
     assert (tmp_path / "g.png").stat().st_size > 0 and (tmp_path / "f.png").stat().st_size > 0
+
+
+def test_field_comparison_attention_logs_bars(tmp_path):
+    xy, f = torch.rand(50, 2), torch.rand(50)
+    plots.plot_field_comparison(xy, f, f + 0.1, tmp_path / "fc.png", "|u|", body=([0.4, 0.5, 0.5], [0.4, 0.4, 0.5]))
+    plots.plot_attention(xy.numpy(), torch.rand(50, 5).softmax(-1).numpy(), torch.rand(4), tmp_path / "at.png")
+    log = {"a": {"step": [0, 50, 100], "total": [3, 2, 1], "data": [1, 0.5, float("nan")]}}
+    plots.plot_training_log(log, tmp_path / "tl.png", keys=("total", "data", "vel_l2"))
+    rows = [dict(method="m1", drag_reduction=0.4, wall_s=10.0), dict(method="m2", drag_reduction=0.3, wall_s=2.0)]
+    plots.plot_benchmark_bars(rows, tmp_path / "bb.png")
+    for n in ("fc.png", "at.png", "tl.png", "bb.png", "fc.npz", "at.npz"):
+        assert (tmp_path / n).stat().st_size > 0

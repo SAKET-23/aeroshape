@@ -228,3 +228,14 @@ def test_load_for_eval_rejects_wrong_kind(tmp_path):  # L5
     save_ckpt(tmp_path / "c.pt", {"model": {}, "config": make_cfg().to_dict(), "metrics": {"kind": "mlp"}})
     with pytest.raises(SystemExit, match="mlp"):
         train03.load_for_eval(tmp_path / "c.pt", "transformer", "cpu")
+
+
+def test_attach_adjoint_grads_mixed_layout(tmp_path):
+    """Steady symmetric gradients land in the first k columns of a cambered row; time-averaged rows stay NaN."""
+    A = {"alpha": torch.zeros(3, 16), "split": torch.zeros(3, dtype=torch.int8), "kind": torch.tensor([0, 0, 1], dtype=torch.int8),
+         "meta": {"runs": [{"id": "a"}, {"id": "b"}, {"id": "t"}]}}
+    done = {k: dict(dcd=torch.full((8,), v), dcl=torch.full((8,), -v)) for k, v in (("a", 1.0), ("b", 2.0))}
+    torch.save(done, tmp_path / "c.pt")
+    train03.attach_adjoint_grads(A, tmp_path / "c.pt")
+    assert A["gcd"][1, :8].eq(2.0).all() and A["gcd"][1, 8:].eq(0).all() and A["gcl"][0, :8].eq(-1.0).all()
+    assert torch.isnan(A["gcd"][2]).all()

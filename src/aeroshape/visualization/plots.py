@@ -126,3 +126,67 @@ def plot_denoise_gif(nurbs, alphas, path, fps=5, label="denoising step"):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     FuncAnimation(fig, frame, frames=len(yu)).save(path, writer=PillowWriter(fps=fps))
     plt.close(fig)
+
+
+def _body(ax, bx, by):
+    if bx is not None:
+        ax.fill(bx, by, color="0.5", zorder=3)
+
+
+def plot_field_comparison(xy, ref, pred, path, title="", body=None):
+    """Scatter-point fields (e.g. |u|): reference (LBM), prediction (PINN), error. xy [P, 2]; body = (x, y) outline."""
+    xy, ref, pred = (np.asarray(t.detach().cpu() if hasattr(t, "detach") else t, dtype=float) for t in (xy, ref, pred))
+    fig, axs = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
+    lo, hi = float(min(ref.min(), pred.min())), float(max(ref.max(), pred.max()))
+    for ax, f, name, cm, kw in ((axs[0], ref, "LBM", "viridis", dict(vmin=lo, vmax=hi)), (axs[1], pred, "PINN", "viridis", dict(vmin=lo, vmax=hi)),
+                                (axs[2], pred - ref, "PINN - LBM", "coolwarm", dict(vmin=-np.abs(pred - ref).max(), vmax=np.abs(pred - ref).max()))):
+        sc = ax.scatter(xy[:, 0], xy[:, 1], c=f, s=2, cmap=cm, **kw)
+        fig.colorbar(sc, ax=ax, shrink=0.8)
+        ax.set(title=f"{title} {name}".strip(), aspect="equal")
+        _body(ax, *(body or (None, None)))
+    _save(fig, path)
+    np.savez(Path(path).with_suffix(".npz"), xy=xy, ref=ref, pred=pred)
+
+
+def plot_attention(xy, attn, x_ctrl, path, title="", body=None):
+    """attn [P, T] head-averaged cross-attention weights of the last block (T = control tokens, optional last = condition token).
+    Left: mean attention per token; right: where the most-attended token is attended."""
+    xy, attn = np.asarray(xy, dtype=float), np.asarray(attn, dtype=float)
+    mean, top = attn.mean(0), int(attn.mean(0).argmax())
+    fig, (a0, a1) = plt.subplots(1, 2, figsize=(11, 3.5), gridspec_kw=dict(width_ratios=[1, 2]))
+    a0.bar(np.arange(len(mean)), mean, color="C3")
+    a0.set(xlabel="token (control point; last = condition)" if len(mean) > len(x_ctrl) else "control point", ylabel="mean attention")
+    sc = a1.scatter(xy[:, 0], xy[:, 1], c=attn[:, top], s=2, cmap="magma")
+    fig.colorbar(sc, ax=a1, shrink=0.8)
+    a1.set(title=f"{title} attention on token {top}".strip(), aspect="equal")
+    _body(a1, *(body or (None, None)))
+    _save(fig, path)
+    np.savez(Path(path).with_suffix(".npz"), xy=xy, attn=attn, x_ctrl=np.asarray(x_ctrl))
+
+
+def plot_training_log(logs, path, keys=("total", "data", "pde", "vel_l2")):
+    """logs: {name: {key: [values]} with 'step'}; one panel per key (log y), one line per run. NaN/empty entries are skipped."""
+    fig, axs = plt.subplots(1, len(keys), figsize=(3.6 * len(keys), 3.2), squeeze=False)
+    for ax, k in zip(axs[0], keys):
+        for name, d in logs.items():
+            s, v = np.asarray(d["step"], dtype=float), np.asarray(d.get(k, []), dtype=float)
+            if len(v) == len(s) and np.isfinite(v).any():
+                ok = np.isfinite(v) & (v > 0)
+                ax.plot(s[ok], v[ok], label=name)
+        ax.set(xlabel="step", title=k, yscale="log")
+    axs[0, 0].legend(fontsize=7)
+    _save(fig, path)
+
+
+def plot_benchmark_bars(rows, path):
+    """rows: result dicts (method, cd_lbm, drag_reduction, wall_s); bars of drag reduction and wall-clock per method."""
+    names = [r["method"] for r in rows]
+    fig, (a0, a1) = plt.subplots(1, 2, figsize=(10, 3.8))
+    a0.bar(names, [100 * r["drag_reduction"] for r in rows], color="C0")
+    a0.set(ylabel="drag reduction vs start (%)")
+    a1.bar(names, [r["wall_s"] for r in rows], color="C1")
+    a1.set(ylabel="wall-clock (s)", yscale="log")
+    for a in (a0, a1):
+        a.tick_params(axis="x", rotation=45, labelsize=7)
+        [t.set_ha("right") for t in a.get_xticklabels()]
+    _save(fig, path)

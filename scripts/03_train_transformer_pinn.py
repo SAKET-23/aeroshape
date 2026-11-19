@@ -27,6 +27,7 @@ from aeroshape.geometry.nurbs import NURBSAirfoil  # noqa: E402
 from aeroshape.lbm.adjoint_solver import lbm_value_and_grad  # noqa: E402
 from aeroshape.optimization.evaluators import PINNEvaluator  # noqa: E402
 from aeroshape.pinn.embeddings import predict_flow, wall_distance  # noqa: E402
+from aeroshape.pinn.mixing import mix_anchors  # noqa: E402
 from aeroshape.pinn.mlp_pinn import MLPPINN  # noqa: E402
 from aeroshape.pinn.navier_stokes_loss import TrainBatch, hybrid_loss  # noqa: E402
 from aeroshape.pinn.sampling import sample_batch  # noqa: E402
@@ -139,7 +140,7 @@ def holdout_eval(model, nurbs, A, device, chunk: int = 4000) -> dict:
     pc, rc = pred[..., 2] - pred[..., 2].mean(1, keepdim=True), ref[..., 2] - ref[..., 2].mean(1, keepdim=True)
     e_uv, e_p = uv(pred, ref).sqrt(), ((pc - rc) ** 2).sum(1).sqrt() / (rc ** 2).sum(1).sqrt()
     glob = (((pred[..., :2] - ref[..., :2]) ** 2).sum() / (ref[..., :2] ** 2).sum()).sqrt()
-    return {"vel_l2": float(glob), "p_l2": float(e_p.mean()), "vel_l2_per_shape": e_uv.tolist()}
+    return {"vel_l2": float(glob), "p_l2": float(e_p.mean()), "vel_l2_per_shape": e_uv.tolist(), "p_l2_per_shape": e_p.tolist()}
 
 
 @torch.no_grad()
@@ -296,14 +297,18 @@ def precompute_train_adjoints(A, nurbs, cache: Path, adj_tier="dev", device="cpu
 
 
 def attach_adjoint_grads(A, cache: Path):
-    """A['gcd'], A['gcl'] [S, D]: adjoint gradients of the training runs (NaN elsewhere); needs a complete cache."""
+    """A['gcd'], A['gcl'] [S, D]: adjoint gradients of the steady (kind 0) training runs, NaN elsewhere (time-averaged runs have none);
+    needs a complete cache. Symmetric-run gradients ([k]) go in the first k columns of a cambered [2k] row (see hybrid_loss)."""
     done = torch.load(cache, weights_only=False)
     S, D = A["alpha"].shape
     A["gcd"], A["gcl"] = torch.full((S, D), float("nan")), torch.full((S, D), float("nan"))
     for i, rid in enumerate(r["id"] for r in A["meta"]["runs"]):
         if rid in done:
-            A["gcd"][i], A["gcl"][i] = done[rid]["dcd"], done[rid]["dcl"]
-    assert torch.isfinite(A["gcd"][A["split"] == 0]).all(), f"{cache} is incomplete: run --precompute-train-adjoint"
+            for key, src in (("gcd", "dcd"), ("gcl", "dcl")):
+                A[key][i] = 0.0 if done[rid][src].numel() < D else float("nan")
+                A[key][i, :done[rid][src].numel()] = done[rid][src]
+    need = (A["split"] == 0) & (A["kind"] == 0)
+    assert torch.isfinite(A["gcd"][need]).all(), f"{cache} is incomplete: run --precompute-train-adjoint"
     return A
 
 
@@ -365,6 +370,7 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("-o", "--set", action="append", default=[], dest="sets")
     ap.add_argument("--anchors", default=ANCHORS)
+    ap.add_argument("--mix-steady", default=None, help="v2: steady symmetric anchors mixed into --anchors (cambered layout, kind 0)")
     ap.add_argument("--eval-only", default=None, help="checkpoint to run Gate 3 on (no training)")
     ap.add_argument("--sweep", action="store_true", help="Fourier-scale sweep (use -o to cut the budget)")
     ap.add_argument("--scales", default="0.25,0.5,1,2")
@@ -380,6 +386,9 @@ def main():
     device = get_device(a.device)
     A = load_ckpt(a.anchors, "cpu")
     assert not check_anchors(A), check_anchors(A)
+    if a.mix_steady:
+        A = mix_anchors(load_ckpt(a.mix_steady, "cpu"), A)
+        assert not check_anchors(A), check_anchors(A)
     out = Path(a.out or f"runs/pinn_{a.model}_{cfg.pinn.version}_{a.tier}")
 
     if a.precompute_train_adjoint:
@@ -405,6 +414,8 @@ def main():
     else:
         model, nurbs, res = train(cfg, a.model, out, device, A)
         print("results:", json.dumps(res, indent=2))
+        if cfg.pinn.version == "v2":  # gate3 is the Re 20 steady check; v2 is evaluated by scripts/03c_pinn_v2_eval.py
+            return
     out.mkdir(parents=True, exist_ok=True)
     fname, cache = "gate3.json", a.adjoint_cache
     if a.eval_set != "holdout":
