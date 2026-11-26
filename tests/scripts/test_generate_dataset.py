@@ -166,3 +166,15 @@ def test_thin_shapes_respect_thickness_window_and_cover_it():
     cfg = load_config(None, "smoke", [])
     ids = [r[0] for r in gen.run_list(cfg, dset="v1b")]
     assert min(ids) == gen.V1B_BASE and all(r[1] == 20 for r in gen.run_list(cfg, dset="v1b"))
+
+
+def test_v2b_list_covers_circle_and_is_valid():  # G38(b); no LBM
+    nurbs = NURBSAirfoil(k=8, mode="cambered", dtype=torch.float64)
+    from aeroshape.geometry.reference_shapes import circle_alpha
+    a = gen.v2b_shapes(nurbs)  # raises on an invalid shape or the exact circle
+    assert a.shape == (24, 16)
+    c = circle_alpha(nurbs)[0]
+    assert bool(((a.amin(0) <= c + 1e-12) & (a.amax(0) >= c - 1e-12)).all())  # v2b alone covers the circle
+    cfg = load_config(None, "dev", [])
+    runs = gen.run_list(cfg, dset="v2b")
+    assert len(runs) == 24 and [r[2] for r in runs].count(10) == 4 and all(r[1] == 1000 and r[0] >= gen.V2B_BASE for r in runs)

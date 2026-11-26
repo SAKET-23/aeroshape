@@ -2,7 +2,7 @@
 uv run python scripts/02_generate_lbm_dataset.py --set v1 --tier dev --device mps [--shard 0/2]
 uv run python scripts/02_generate_lbm_dataset.py --set v1 --tier dev --merge
 uv run python scripts/02_generate_lbm_dataset.py --set v1 --tier dev --check [--blockage]
-Config overrides: -o key=value (repeatable); `--set` selects the dataset set (v1 | v2)."""
+Config overrides: -o key=value (repeatable); `--set` selects the dataset set (v1 | v1b | v2 | v2b)."""
 import argparse
 import datetime
 import os
@@ -19,7 +19,7 @@ from aeroshape.core.timing import Timer  # noqa: E402
 from aeroshape.core.types import Condition  # noqa: E402
 from aeroshape.geometry.ibb_grid_mapper import map_to_grid  # noqa: E402
 from aeroshape.geometry.nurbs import NURBSAirfoil, rotate  # noqa: E402
-from aeroshape.geometry.reference_shapes import circle_alpha, lhs_shapes, naca4_alpha  # noqa: E402
+from aeroshape.geometry.reference_shapes import circle_alpha, is_valid, lhs_shapes, naca4_alpha, perturb, rae2822_alpha, shape_distance  # noqa: E402
 from aeroshape.lbm import d2q9_solver as S  # noqa: E402
 from aeroshape.lbm.aero_forces import force_fn  # noqa: E402
 from aeroshape.lbm.lattice import lbm_to_nondim, make_params  # noqa: E402
@@ -30,6 +30,8 @@ K_SYM, NEAR_WALL_D, NEAR_FRACTION, CYLINDER_CD_20x10 = 8, 0.2, 0.3, 2.415  # WP 
 def run_list(cfg, n_re40=10, dset="v1"):
     """[(shape_idx, re, aoa)] v2: Re 1000 at AoA 0 and 10 per shape. v1: Re 20 for every shape, then Re 40 for the first n_re40; v1b: Re 20 only, ids from V1B_BASE."""
     n = cfg.dataset.n_shapes
+    if dset == "v2b":  # G38(b): Re 1000, AoA 0 for the first V2B_N0 shapes, AoA 10 for the rest
+        return [(V2B_BASE + i, 1000, 0 if i < V2B_N0 else 10) for i in range(V2B_N0 + V2B_N10)]
     if dset == "v2":  # Re 1000 at AoA 0 and 10 for every cambered shape
         return [(i, 1000, aoa) for i in range(n) for aoa in (0, 10)]
     if dset == "v1b":
@@ -38,6 +40,31 @@ def run_list(cfg, n_re40=10, dset="v1"):
 
 
 V1B_BASE, V1B_T = 100, (0.08, 0.35)  # G31: extra thin-shape set, run ids s100.., all train
+
+
+V2B_BASE, V2B_N0, V2B_N10 = 200, 20, 4  # G38(b) coverage set: run ids s200.., all train
+
+
+def v2b_shapes(nurbs, seed=0):
+    """[V2B_N0 + V2B_N10, 16] cambered shapes (nurbs: k = 8, cambered). 8 scaled, cambered circles (scale 0.8-1.1, so the
+    circle's entries fall inside the per-entry box), 12 circle <-> {RAE2822, NACA2412, NACA0012} blends, 4 perturbations of
+    RAE2822 / NACA2412 for AoA 10. The exact circle is excluded."""
+    circ, rae = circle_alpha(nurbs)[0], rae2822_alpha(nurbs)[0]
+    n24, n12 = naca4_alpha(nurbs, "2412")[0], naca4_alpha(nurbs, "0012")[0]
+    k, g = nurbs.k, torch.Generator().manual_seed(seed)
+    cam = lambda a: ((a[:k] + a[k:]) / 2).repeat(2)  # camber line in the cambered layout
+    u = torch.rand(V2B_N0, 4, dtype=torch.float64, generator=g)
+    a = [s * circ + (0.3 + 1.7 * c) * cam(rae if j % 2 else n24)
+         for j, (s, c) in enumerate(zip(torch.linspace(0.8, 1.1, 8).tolist(), u[:8, 0].tolist()))]
+    for r in u[8:].tolist():  # blend: w circle + (1 - w) airfoil mix, scaled
+        m = torch.tensor([r[1] + 0.1, r[2] + 0.1, r[3] + 0.1], dtype=torch.float64)
+        other = (m / m.sum()) @ torch.stack([rae, n24, n12])
+        a.append((0.95 + 0.15 * r[0]) * ((0.4 + 0.5 * r[1]) * circ + (1 - 0.4 - 0.5 * r[1]) * other))
+    near = lambda b, sd: (lambda q: q[is_valid(nurbs, q)][:2])(perturb(b[None], 12, 0.01, 0.3, sd, nurbs))  # first 2 valid of 12
+    a = torch.stack(a + [*near(rae, seed), *near(n24, seed + 1)])
+    if not bool(is_valid(nurbs, a).all()) or bool((shape_distance(nurbs, a, circ.expand_as(a)) < 0.005).any()):
+        raise ValueError("v2b list has an invalid shape or the exact circle")
+    return a
 
 
 def thickness(nurbs, alpha):
@@ -191,14 +218,14 @@ def generate(a, cfg, device, dtype):
     nurbs = NURBSAirfoil(k=K_SYM, device=device, dtype=dtype)
     ref = NURBSAirfoil(k=K_SYM, dtype=torch.float64)
     dset = getattr(a, "dset", "v1")
-    b, v2 = dset == "v1b", dset == "v2"
+    b, v2 = dset == "v1b", dset in ("v2", "v2b")
     if v2:  # cambered, D = 2k = 16 (G2)
         nurbs = NURBSAirfoil(k=K_SYM, mode="cambered", device=device, dtype=dtype)
         ref = NURBSAirfoil(k=K_SYM, mode="cambered", dtype=torch.float64)
-    alphas = (thin_shapes(ref, cfg.dataset.n_shapes, cfg.seed + 777) if b else
+    alphas = (v2b_shapes(ref) if dset == "v2b" else thin_shapes(ref, cfg.dataset.n_shapes, cfg.seed + 777) if b else
               lhs_shapes(ref, cfg.dataset.n_shapes, cfg.seed, family="dataset"))
-    base = V1B_BASE if b else 0
-    first_holdout = 10 ** 9 if b else cfg.dataset.n_shapes - cfg.dataset.n_holdout  # v1b: every run is train
+    base = {"v1b": V1B_BASE, "v2b": V2B_BASE}.get(dset, 0)
+    first_holdout = 10 ** 9 if b or dset == "v2b" else cfg.dataset.n_shapes - cfg.dataset.n_holdout  # v1b: every run is train
     N = cfg.lbm.cells_per_d_high_re if v2 else cfg.lbm.cells_per_d
     runs = shard(run_list(cfg, a.n_re40, dset), *a.shard)
     want = lbm_signature(cfg, N)
@@ -209,7 +236,7 @@ def generate(a, cfg, device, dtype):
             print(f"[{n + 1}/{len(runs)}] skip {path.name} (converged)", flush=True)
             continue
         with Timer(device) as t:
-            res = (solve(cfg, nurbs, alphas[i], re, aoa, N, device, dtype, unsteady=True) if v2 else
+            res = (solve(cfg, nurbs, alphas[i - base], re, aoa, N, device, dtype, unsteady=True) if v2 else
                    solve(cfg, nurbs, alphas[i - base], re, aoa, N, device, dtype, prev.get(re)))
         if not v2 and res["converged"] and torch.isfinite(res["f"]).all():
             prev[re] = res["f"]  # v2 starts cold: the 30-convective-time transient is fixed, a warm start saves nothing
@@ -236,13 +263,18 @@ def generate(a, cfg, device, dtype):
 
 def merge(a):
     out = Path(a.out)
-    items = [torch.load(f, weights_only=False) for f in sorted(out.glob("s*_re*_aoa*.pt"))]
+    files = sorted(out.glob("s*_re*_aoa*.pt"))
+    if a.dset == "v2b":  # v2 runs (train + holdout, unchanged order) then v2b -> dev_v2/merged_v2v2b.pt
+        out = Path(a.out).parent / "dev_v2"
+        files = sorted(out.glob("s*_re*_aoa*.pt")) + files
+    items = [torch.load(f, weights_only=False) for f in files]
     if not items:
         raise SystemExit(f"no run files in {out}")
     m = merge_anchors(items)
     m["meta"]["created"] = datetime.datetime.now().isoformat()
-    save_ckpt(out / "merged.pt", m)
-    print(f"merged {len(items)} runs -> {out / 'merged.pt'} ({(out / 'merged.pt').stat().st_size / 1e6:.1f} MB)")
+    dst = out / ("merged_v2v2b.pt" if a.dset == "v2b" else "merged.pt")
+    save_ckpt(dst, m)
+    print(f"merged {len(items)} runs -> {dst} ({dst.stat().st_size / 1e6:.1f} MB)")
 
 
 def circle_row(a, cfg):
@@ -262,14 +294,14 @@ def check(a, cfg):
     """Gate 2b report; returns True when everything passes."""
     from aeroshape.pinn.sampling import sample_batch
 
-    path = Path(a.out) / "merged.pt"
+    path = Path(a.out).parent / "dev_v2/merged_v2v2b.pt" if a.dset == "v2b" else Path(a.out) / "merged.pt"
     d = torch.load(path, weights_only=False)
     rows = []
     bad = check_anchors(d)
     rows.append(("merged loads, contract keys/shapes, finite", not bad, "; ".join(bad) or f"{d['xy'].shape[0]} runs"))
     runs = d["meta"]["runs"]
-    if a.dset == "v2":  # Re 1000 time-averaged: contract + run count + how each run was averaged
-        want = len(run_list(cfg, dset="v2"))
+    if a.dset in ("v2", "v2b"):  # Re 1000 time-averaged: contract + run count + how each run was averaged
+        want = len(run_list(cfg, dset="v2")) + (len(run_list(cfg, dset="v2b")) if a.dset == "v2b" else 0)
         modes = [r["mode_used"] for r in runs]
         rows.append(("all runs present", len(runs) == want, f"{len(runs)}/{want}; mode_used: " +
                      ", ".join(f"{m}={modes.count(m)}" for m in sorted(set(modes)))))
@@ -313,7 +345,7 @@ def blockage(cfg_over, tier, device, dtype, N=20):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--set", default="v1", choices=["v1", "v1b", "v2"], dest="dset")
+    ap.add_argument("--set", default="v1", choices=["v1", "v1b", "v2", "v2b"], dest="dset")
     ap.add_argument("--tier", default="dev", choices=["smoke", "dev", "full"])
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     ap.add_argument("--shard", default="0/1", help="i/n: process every n-th run starting at i")
@@ -325,9 +357,9 @@ def main(argv=None):
     ap.add_argument("--out", default=None, help="default data/lbm_anchors/<tier>")
     ap.add_argument("-o", action="append", default=[], dest="overrides", help="config override key=value")
     a = ap.parse_args(argv)
-    if a.dset == "v2":
+    if a.dset in ("v2", "v2b"):
         a.overrides = V2_CASE + a.overrides
-    a.out = a.out or f"data/lbm_anchors/{a.tier}" + ("_v2" if a.dset == "v2" else "")
+    a.out = a.out or f"data/lbm_anchors/{a.tier}" + {"v2": "_v2", "v2b": "_v2b"}.get(a.dset, "")
     a.shard = tuple(int(x) for x in a.shard.split("/"))
     cfg = load_config(None, a.tier, a.overrides)
     device = get_device(a.device)

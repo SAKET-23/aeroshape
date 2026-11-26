@@ -8,3 +8,12 @@ __pycache__/
 .pytest_cache/
 *.pt
 !tests/fixtures/**
+
+# source report (not redistributed)
+docs/*.pdf
+# local agent tooling config
+.claude/
+.mcp.json
+.ignore
+.trail/
+scripts/__pycache__/
