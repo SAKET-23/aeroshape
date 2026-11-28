@@ -69,9 +69,37 @@ Objective: minimise $C_D$ with $C_L$ held at the LBM value of RAE2822 (0.367) an
 - Drag falls in the first 3 cycles, then holds at 0.145–0.151 while lift oscillates about ±0.04 around the target. The run stopped at its 20-cycle cap, not on a convergence test.
 - The "start" curve in the shape plot is this run's start: the best shape of an earlier run (cycle 2, $C_D$ 0.168).
 
-### Case 2: circle → RAE2822, Re 1000 (not solved yet)
+**Case 3 benchmark** (all shapes re-scored by the LBM; drag reduction is against the driver's first cycle, $C_D$ 0.168; target $C_L$ 0.367):
 
-The time-averaged adjoint gives a usable gradient on the Case 3 airfoil (cosine 0.92 against window-mean finite differences) but not on the separated blob of Case 2 (cosine −0.13; MPS and CUDA agree), so the earlier Case 2 run never left the blob. Case 2 now uses a finite-difference gradient (`--evaluator fd_lbm`, $1 + 2n$ LBM solves per cycle); that run is pending. Details: decision G42 in `Plan/raw/gaps_and_decisions.md`; check script `scripts/09_check_re1000_gradient.py`.
+| Method | $C_D$ (LBM) | $C_L$ (LBM) | Distance to RAE2822 | Wall-clock |
+|---|---|---|---|---|
+| LBM adjoint | **0.147** | 0.367 | **0.0051** | 6596 s (A40) |
+| Transformer PINN (no envelope) | 0.159 | 0.361 | 0.0267 | 63 s |
+| Transformer PINN (training-box envelope) | 0.165 | 0.422 | 0.0148 | 59 s |
+| Guided diffusion | 0.173 | 0.335 | 0.0102 | **4.0 s** |
+| MLP PINN (training-box envelope) | 0.633 | 1.120 | 0.0857 | 26 s |
+| MLP PINN (no envelope) | 0.830 | 1.236 | 0.0897 | 31 s |
+
+- The LBM adjoint wins on both drag and lift. The Transformer PINN gets within 8% of its drag in about 1% of the time; the MLP PINN fails at Re 1000 (its shapes more than quadruple the drag).
+- A hybrid row (PINN gradient, LBM line search) was started and stopped at cycle 9 ($C_D$ ≈ 0.157) to free the GPU for the gate; it is not in the table.
+
+### Case 2: circle → RAE2822, Re 1000 (partial)
+
+The time-averaged adjoint gives a usable gradient on the Case 3 airfoil (cosine 0.92 against window-mean finite differences) but not on the separated blob of Case 2 (cosine −0.13; MPS and CUDA agree), so the earlier Case 2 run never left the blob. Case 2 therefore uses a finite-difference gradient (`--evaluator fd_lbm`, $1 + 2n$ LBM solves per cycle; `05 --fd-cases 2`). Details: decision G42 in `Plan/raw/gaps_and_decisions.md`; check script `scripts/09_check_re1000_gradient.py`.
+
+- **The finite-difference gradient works:** drag fell 1.402 → 1.250 → 1.174 in 3 cycles (−16%). One cycle costs about 40 min on the A40, so a converged run (about 16+ cycles) needs 12–20 GPU hours; the run was stopped after 3 cycles (G43).
+- None of the 3 cycles met the lift constraint (target $C_L$ −0.043; cycle 3 has 0.040), so the best-point rule (feasible points first, then smallest lift error) keeps the start, and that is what the table re-scores.
+
+| Method | $C_D$ (LBM) | $C_L$ (LBM) | Lift error | Distance to RAE2822 | Wall-clock |
+|---|---|---|---|---|---|
+| LBM finite-difference gradient (3 cycles, start re-scored) | 1.402 | −0.026 | 0.017 | 0.285 | 9552 s (A40) |
+| Guided diffusion | 1.424 | 0.035 | 0.078 | 0.275 | 4.0 s |
+| Transformer PINN (training-box envelope) | 0.333 | −0.370 | 0.327 | 0.087 | 15 s |
+| Transformer PINN (no envelope) | 0.454 | −0.405 | 0.362 | 0.109 | 19 s |
+| MLP PINN (training-box envelope) | 0.569 | −0.925 | 0.883 | 0.091 | 6 s |
+| MLP PINN (no envelope) | 0.762 | −0.530 | 0.487 | 0.108 | 7 s |
+
+- The PINN rows thin the blob into much closer airfoil shapes with far lower LBM drag, but miss the lift target by 0.33–0.88, so none is a feasible answer to the constrained problem. They show what a fast surrogate can do as a starting point; a finite-difference or adjoint LBM run from a PINN shape is the obvious next step.
 
 ### Solver validation
 
@@ -114,9 +142,11 @@ The time-averaged adjoint gives a usable gradient on the Case 3 airfoil (cosine 
 | PINN surrogates, Re 20 | done; Gate 3 passed |
 | Diffusion, Case 1 benchmark | done |
 | PINN v2 (Re 1000 time-averaged) | trained, with a coverage set for the Case 2 start shape |
-| Case 3 (Re 1000, NACA2412 → RAE2822) | LBM adjoint done: −20% $C_D$ at target $C_L$; benchmark rows (PINN, diffusion) pending |
-| Case 2 (Re 1000, circle → RAE2822) | adjoint gradient unusable on the blob (measured); finite-difference run pending |
-| CUDA on a cloud GPU | used on RunPod A40 (Case 1 v2, Case 3); `torch.compile` 0.55 ms vs eager 2.92 ms per LBM step; `scripts/cuda_check.sh` not run as a gate |
+| Case 3 (Re 1000, NACA2412 → RAE2822) | done: LBM adjoint −20% $C_D$ at target $C_L$; PINN and diffusion rows in the table |
+| Case 2 (Re 1000, circle → RAE2822) | partial: adjoint unusable on the blob; finite-difference gradient −16% $C_D$ in 3 cycles, not converged (12–20 GPU h needed) |
+| Smoke e2e | passes on CPU, MPS (111 s) and CUDA A40 (142 s); summaries within tolerance of the reference |
+| CUDA tests | 3 failures in the opt-in `torch.compile` / CUDA-graph tests (`tests/lbm/test_accel.py`); the full suite was too slow to finish on the pod's CPU |
+| Gate 4 | **passed with documented exceptions** (Case 2 partial, CUDA-graph tests); see G43 |
 
 ---
 

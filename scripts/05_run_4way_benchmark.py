@@ -35,7 +35,7 @@ from aeroshape.visualization.plots import plot_denoise_gif  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 CASES = {1: "case1_circle_to_naca_re20.yaml", 2: "case2_circle_to_rae_re1000.yaml", 3: "case3_naca_to_rae_aoa10.yaml"}
 # run key -> (evaluator, optimizer.box); G37: boxed PINN rows are the headline, "_nobox" rows keep the surrogate-exploitation evidence
-RUNS = {"adjoint_lbm": ("adjoint_lbm", None), "mlp_pinn": ("mlp_pinn", "pinn_train"), "transformer_pinn": ("transformer_pinn", "pinn_train"),
+RUNS = {"adjoint_lbm": ("adjoint_lbm", None), "fd_lbm": ("fd_lbm", None), "mlp_pinn": ("mlp_pinn", "pinn_train"), "transformer_pinn": ("transformer_pinn", "pinn_train"),
         "mlp_pinn_nobox": ("mlp_pinn", None), "transformer_pinn_nobox": ("transformer_pinn", None)}
 METHODS = ["adjoint_lbm", "mlp_pinn", "transformer_pinn", "diffusion", "mlp_pinn_nobox", "transformer_pinn_nobox"]
 HYBRID = "hybrid_transformer_pinn"  # --hybrid only: PINN gradient, LBM line search (evaluator lives in optimization/evaluators.py)
@@ -46,7 +46,8 @@ BOX_ANCHORS = {1: {"mlp_pinn": "data/lbm_anchors/dev/merged_v1v1b.pt",  # v1b ML
 BOX_ANCHORS[3] = BOX_ANCHORS[2]
 TARGET_NAME = {1: "NACA0012", 2: "RAE2822", 3: "RAE2822"}
 CAMBERED_DIFFUSION = "runs/diffusion_v2_dev/ckpt/diffusion.pt"
-LABEL = {"adjoint_lbm": "LBM adjoint", "mlp_pinn": "MLP-PINN", "transformer_pinn": "Transformer-PINN",
+DRIVERS = ("adjoint_lbm", "fd_lbm")  # method 1; G42: fd_lbm replaces the adjoint for --fd-cases
+LABEL = {"adjoint_lbm": "LBM adjoint", "fd_lbm": "LBM finite-difference gradient", "mlp_pinn": "MLP-PINN", "transformer_pinn": "Transformer-PINN",
          "diffusion": "Guided diffusion", "mlp_pinn_nobox": "MLP-PINN (no envelope)", "transformer_pinn_nobox": "Transformer-PINN (no envelope)",
          HYBRID: "Hybrid Transformer-PINN (LBM line search)"}
 N_SAMPLES = 8
@@ -97,7 +98,7 @@ def check_box_dim(anchor_file, cfg):
 
 def up_front(method, train_s):
     """Training wall-clock (s) behind the method; diffusion also needs the Transformer-PINN for guidance. Data generation not included."""
-    return 0.0 if method == "adjoint_lbm" else train_s["transformer_pinn"] + train_s["diffusion_only"] if method == "diffusion" \
+    return 0.0 if method in DRIVERS else train_s["transformer_pinn"] + train_s["diffusion_only"] if method == "diffusion" \
         else train_s["transformer_pinn" if method == HYBRID else method.removesuffix("_nobox")]
 
 
@@ -145,10 +146,15 @@ def run_diffusion(cfg, opt06, a, out, cd_target, cl_ref, models, device):
                peak_mem_bytes=peak_memory(device), cd_target=cd_target, cd_final_lbm=float(cd), cl_final_lbm=float(cl), cl_ref=cl_ref,
                cd_own_last=own_cd, cl_own_last=own_cl, J_best=float(J[best]), J_all=J.tolist(), stop_reason="one_pass",
                viol_final=float(torch.relu(t_min[0] - nurbs.thickness_at_ctrl(alpha).reshape(-1)).max()),
-               shape_distance_to_target=float(shape_distance(ref64, alpha.cpu().double().reshape(-1), opt06.shape(nurbs, c.target).cpu().double())),
+               shape_distance_to_target=float(target_distance(opt06, ref64, nurbs, alpha, c.target)),
                alpha_final=alpha.reshape(-1).tolist(), guide_scale=dc.guide_scale, cfg_scale=dc.cfg_scale)
     (out / "results.json").write_text(json.dumps(res, indent=2))
     return res
+
+
+def target_distance(opt06, ref64, nurbs, alpha, target):
+    """RMS y-distance of alpha [1, D] to the fitted reference; keep [1, D] (cambered _split indexes a[:, :k])."""
+    return shape_distance(ref64, alpha.cpu().double(), opt06.shape(nurbs, target).cpu().double())
 
 
 def row(method, r, r1, lat, train_s):
@@ -212,8 +218,9 @@ def figures(out, case, c, rows, shapes, hist, nurbs):
     fig, ax = plt.subplots(figsize=(5.5, 3.8))
     for r in rows:
         ax.scatter(r["wall_s"], r["cd_lbm"], label=LABEL[r["method"]], zorder=3)
-    if "adjoint_lbm" in hist:  # method 1 trace: its own (LBM) CD per cycle vs cumulative wall-clock
-        ax.plot(hist["adjoint_lbm"]["wall_s"].cumsum(0), hist["adjoint_lbm"]["cd"], color="gray", lw=0.8, label="LBM adjoint trace")
+    drv = next((k for k in DRIVERS if k in hist), None)
+    if drv:  # method 1 trace: its own (LBM) CD per cycle vs cumulative wall-clock
+        ax.plot(hist[drv]["wall_s"].cumsum(0), hist[drv]["cd"], color="gray", lw=0.8, label=f"{LABEL[drv]} trace")
     ax.set(xscale="log", xlabel="wall-clock to final shape (s)", ylabel="CD (LBM-scored)", title=f"Case {case}")
     ax.legend(fontsize=7)
     fig.savefig(out / "fig" / f"cd_vs_wallclock_case{case}.png", dpi=150, bbox_inches="tight")
@@ -227,6 +234,7 @@ def main(argv=None):
     ap.add_argument("--tier", default="dev", choices=["smoke", "dev", "full"])
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     ap.add_argument("--cases", type=int, nargs="+", default=[1], choices=[1, 2, 3])
+    ap.add_argument("--fd-cases", type=int, nargs="*", default=[], choices=[1, 2, 3], help="cases whose LBM driver (method 1) is fd_lbm, not adjoint_lbm (G42)")
     ap.add_argument("--hybrid", action="store_true", help=f"also run {HYBRID} (PINN gradient, LBM line search)")
     ap.add_argument("--resume", action="store_true", help="skip sub-runs that already have a results.json; continue ones with a state.pt from their last cycle")
     ap.add_argument("--out", default=None)
@@ -237,8 +245,8 @@ def main(argv=None):
     opt06 = _load("opt06", "06_optimize_case.py")
     device = get_device(a.device)
     models = {c: models_for(c, a) for c in a.cases}  # fail before any work
-    runs = {k: v for k, v in RUNS.items() if k != HYBRID or a.hybrid}
-    methods = METHODS + [HYBRID] * a.hybrid
+    all_runs = {k: v for k, v in RUNS.items() if k != HYBRID or a.hybrid}
+    all_methods = METHODS + [HYBRID] * a.hybrid
     results = {"tier": a.tier, "device": device.type, "overrides": a.sets, "cases": {}, "failures": {}}
     for case in a.cases:
         m, case_file = models[case], CASES[case]
@@ -249,16 +257,19 @@ def main(argv=None):
         cfg = load_config(case_file, a.tier, gsets + a.sets)  # user -o wins
         c = cfg.case
         g = cfg.geometry
+        drv = "fd_lbm" if case in a.fd_cases else "adjoint_lbm"
+        runs = {k: v for k, v in all_runs.items() if k == drv or k not in DRIVERS}
+        methods = [drv if k == "adjoint_lbm" else k for k in all_methods]
         done, hist, lat = {}, {}, {}
         seed_everything(cfg.seed)
         for meth, (ev, box) in runs.items():
             d = out / f"case{case}_{meth}"
             if not (a.resume and (d / "results.json").exists()):
-                cycles = cfg.optimizer.max_cycles * (1 if ev == "adjoint_lbm" else 10)
+                cycles = cfg.optimizer.max_cycles * (1 if ev in DRIVERS else 10)
                 args = resume_args(a.resume, d) + ["--case", case_file, "--evaluator", ev, "--tier", a.tier, "--device", a.device, "--out", str(d),
                         *sum((["--set", s] for s in a.sets), []), "--set", f"optimizer.max_cycles={cycles}"]
                 ck = "transformer_pinn" if ev == HYBRID else ev
-                args += ["--ckpt", str(m[ck])] if ev != "adjoint_lbm" else []
+                args += ["--ckpt", str(m[ck])] if ev not in DRIVERS else []
                 try:
                     if box:
                         check_box_dim(BOX_ANCHORS[min(case, 2)][ck], cfg)
@@ -273,7 +284,7 @@ def main(argv=None):
             (out / "histories").mkdir(exist_ok=True)
             shutil.copy(d / "history.pt", out / "histories" / f"case{case}_{meth}.pt")
         nurbs = NURBSAirfoil(k=g.k, degree=g.degree, M=g.M, mode=g.mode, device=device, dtype=torch.float32)
-        for meth in (k for k in runs if k != "adjoint_lbm"):
+        for meth in (k for k in runs if k != drv):
             if meth in done:
                 d = out / f"case{case}_{meth}"
                 if not (a.resume and (d / "latency.json").exists()):
@@ -281,26 +292,26 @@ def main(argv=None):
                     (d / "latency.json").write_text(json.dumps(
                         {"latency_s": latency(model, nurbs, opt06.shape(nurbs, c.start).reshape(1, -1), Condition(c.re, c.aoa))}))
                 lat[meth] = json.loads((d / "latency.json").read_text())["latency_s"]
-        if "adjoint_lbm" in done:
+        if drv in done:
             d = out / f"case{case}_diffusion"
             try:
                 if not (a.resume and (d / "results.json").exists()):
                     d.mkdir(parents=True, exist_ok=True)
-                    run_diffusion(cfg, opt06, a, d, done["adjoint_lbm"]["cd_final_lbm"], done["adjoint_lbm"]["cl_ref"], m, device)
+                    run_diffusion(cfg, opt06, a, d, done[drv]["cd_final_lbm"], done[drv]["cl_ref"], m, device)
                 done["diffusion"] = json.loads((d / "results.json").read_text())
             except (Exception, SystemExit):
                 results["failures"][f"case{case}_diffusion"] = traceback.format_exc()
                 print(f"FAILED case{case}_diffusion\n{traceback.format_exc()}", flush=True)
         else:
             results["failures"][f"case{case}_diffusion"] = "needs method 1's final CD as the target"
-        if "adjoint_lbm" not in done:
+        if drv not in done:
             continue
-        rows = [row(k, done[k], done["adjoint_lbm"], lat.get(k), m["train_s"]) for k in methods if k in done]
+        rows = [row(k, done[k], done[drv], lat.get(k), m["train_s"]) for k in methods if k in done]
         results["cases"][case] = rows
         shapes = {"start": opt06.shape(nurbs, c.start), "target": opt06.shape(nurbs, c.target),
                   **{k: torch.tensor(done[k]["alpha_final"]) for k in done}}
         figures(out, case, c, rows, shapes, hist, nurbs)
-        results[f"case{case}_target_cd"] = done["adjoint_lbm"]["cd_final_lbm"]
+        results[f"case{case}_target_cd"] = done[drv]["cd_final_lbm"]
     (out / "results.json").write_text(json.dumps(results, indent=2))
     write_md(results, out / "results.md", {str(c): TARGET_NAME[c] for c in a.cases})
     print("wrote", out / "results.json")

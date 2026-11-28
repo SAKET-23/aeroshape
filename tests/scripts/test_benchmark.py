@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("bench05", ROOT / "scripts" / "05_run_4way_benchmark.py")
@@ -102,3 +103,49 @@ def test_resume_args_for_partial_subrun(tmp_path):
     assert bench.resume_args(True, tmp_path) == ["--resume"] and bench.resume_args(False, tmp_path) == []
     (tmp_path / "results.json").write_text("{}")
     assert bench.resume_args(True, tmp_path) == []
+
+
+def test_fd_cases_swaps_driver(tmp_path, monkeypatch):
+    import torch
+    _fake_runs(tmp_path, monkeypatch, True)
+    out, launched, dtarget = tmp_path / "out", [], {}
+
+    def fake_main(args):
+        d = Path(args[args.index("--out") + 1])
+        launched.append((args[args.index("--evaluator") + 1], d.name, "--ckpt" in args))
+        d.mkdir(parents=True)
+        torch.save({"alpha": torch.zeros(1, 2), "wall_s": torch.ones(1), "cd": torch.ones(1)}, d / "history.pt")
+        (d / "results.json").write_text(json.dumps(dict(cd_first=2.0, cd_final_lbm=1.5, cl_final_lbm=0.1, cl_ref=0.3, wall_s=1.0, peak_mem_bytes=1,
+                                                         cycles=1, stop_reason="x", cd_own_last=1.5, cl_own_last=0.1, viol_final=0.0,
+                                                         shape_distance_to_target=0.1, alpha_final=[0.0, 0.0])))
+
+    def fake_diffusion(cfg, opt06, a, d, cd_target, cl_ref, m, device):
+        dtarget.update(cd=cd_target, cl=cl_ref)
+        (d / "results.json").write_text(json.dumps(dict(cd_final_lbm=1.4, cl_final_lbm=0.3, cl_ref=cl_ref, wall_s=1.0, peak_mem_bytes=1, cycles=1,
+                                                         stop_reason="one_pass", cd_own_last=1.4, cl_own_last=0.3, viol_final=0.0,
+                                                         shape_distance_to_target=0.1, alpha_final=[0.0, 0.0])))
+
+    fake06 = type("M", (), dict(main=staticmethod(fake_main), load_model=staticmethod(lambda *a: None),
+                                shape=staticmethod(lambda n, s: torch.zeros(2))))
+    monkeypatch.setattr(bench, "_load", lambda name, file: fake06)
+    monkeypatch.setattr(bench, "run_diffusion", fake_diffusion)
+    monkeypatch.setattr(bench, "check_box_dim", lambda *a: None)
+    monkeypatch.setattr(bench, "latency", lambda *a, **k: 0.01)
+    monkeypatch.setattr(bench, "figures", lambda *a, **k: None)
+    assert bench.main(["--tier", "smoke", "--device", "cpu", "--cases", "2", "--fd-cases", "2", "--out", str(out)]) == 0
+    assert ("fd_lbm", "case2_fd_lbm", False) in launched and not any(ev == "adjoint_lbm" or d.endswith("adjoint_lbm") for ev, d, _ in launched)
+    assert dtarget == dict(cd=1.5, cl=0.3)
+    res = json.loads((out / "results.json").read_text())
+    assert [r["method"] for r in res["cases"]["2"]][0] == "fd_lbm" and res["cases"]["2"][3]["method"] == "diffusion" and not res["failures"]
+    assert "LBM finite-difference gradient" in (out / "results.md").read_text()
+
+
+def test_target_distance_cambered():  # run_diffusion crashed on Case 3: 1-D alpha into cambered _split
+    import math
+
+    from aeroshape.geometry.nurbs import NURBSAirfoil
+    opt06 = bench._load("opt06", "06_optimize_case.py")
+    nurbs = NURBSAirfoil(k=8, M=200, mode="cambered")
+    ref64 = NURBSAirfoil(k=8, M=200, mode="cambered", dtype=torch.float64)
+    alpha = opt06.shape(nurbs, "naca0012").reshape(1, -1)
+    assert math.isfinite(float(bench.target_distance(opt06, ref64, nurbs, alpha, "rae2822")))

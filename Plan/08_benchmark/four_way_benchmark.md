@@ -48,6 +48,8 @@ uv run python scripts/05_run_4way_benchmark.py --tier dev --device mps --cases 2
 uv run python scripts/05_run_4way_benchmark.py --tier full --device cuda                  # cloud
 ```
 
+`--fd-cases 2` swaps method 1 (the driver row and diffusion target) from `adjoint_lbm` to `fd_lbm` (run dir `case2_fd_lbm`, label "LBM finite-difference gradient") for those cases, because the Case 2 adjoint gradient is unusable (G42); other cases are unchanged.
+
 Each method × case is a separate sub-run (`scripts/06_optimize_case.py`) with its own folder, so a crash in one does not lose the others and `--resume` skips finished ones.
 
 ## Fairness rules

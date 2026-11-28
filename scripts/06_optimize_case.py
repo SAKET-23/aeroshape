@@ -144,7 +144,8 @@ def main(argv=None):
         print(f"start-from {a.start_from}: record cycle {sf_cycle} (cd {sf_cd:.5f})", flush=True)
         start = project_thickness(nurbs, start, t_min.to(nurbs.mask))
     warm = build_evaluator(cfg, ev_name, nurbs, N, model)
-    warm.evaluate(start, cond, opt._weights())
+    if ev_name != "fd_lbm":  # fd_lbm evaluate = 1+2*n_free full LBM solves; the forward solve in value() already warms caches
+        warm.evaluate(start, cond, opt._weights())
     warm.value(start, cond, opt._weights())
     reset_peak(device)
     with Timer(device) as tm:

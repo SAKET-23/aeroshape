@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 ROOT = Path(__file__).parents[2]
@@ -54,3 +55,44 @@ def test_fd_lbm_takes_the_lbm_only_path(tmp_path, monkeypatch):
     except Stop:
         pass
     assert seen == dict(name="fd_lbm", model=None, dtype=torch.float64)
+
+
+@pytest.mark.parametrize("ev_name,evaluate_called", [("fd_lbm", False), ("adjoint_lbm", True)])
+def test_warmup_skips_evaluate_for_fd_lbm(tmp_path, monkeypatch, ev_name, evaluate_called):
+    class Stop(Exception):
+        pass
+
+    built = []
+
+    class Ev:
+        def __init__(self):
+            self.calls = []
+            built.append(self)
+
+        def evaluate(self, *a):
+            self.calls.append("evaluate")
+
+        def value(self, *a):
+            self.calls.append("value")
+
+    class FakeOpt:
+        records = []
+
+        def __init__(self, *a, **k):
+            pass
+
+        def _weights(self):
+            return None
+
+        def run(self, *a, **k):
+            raise Stop
+
+    monkeypatch.setattr(opt06, "lbm_cl_ref", lambda *a, **k: 0.5)
+    monkeypatch.setattr(opt06, "load_model", lambda *a, **k: None)
+    monkeypatch.setattr(opt06, "build_evaluator", lambda *a, **k: Ev())
+    monkeypatch.setattr(opt06, "AugmentedLagrangianOptimizer", FakeOpt)
+    with pytest.raises(Stop):
+        opt06.main(["--case", str(ROOT / "configs/case1_circle_to_naca_re20.yaml"), "--evaluator", ev_name, "--tier", "smoke",
+                    "--device", "cpu", "--set", "optimizer.box=null", "--out", str(tmp_path)])
+    warm = built[-1]
+    assert ("evaluate" in warm.calls) == evaluate_called and "value" in warm.calls
