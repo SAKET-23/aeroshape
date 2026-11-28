@@ -1,9 +1,11 @@
 """Regenerate every available figure into runs/figures/ from existing results (no solver runs; PINN forward passes on CPU).
 uv run python scripts/07_make_figures.py"""
+import argparse
 import importlib.util
 import json
 import os
 import shutil
+from types import SimpleNamespace
 from pathlib import Path
 
 os.environ["AEROSHAPE_DEVICE"] = "cpu"
@@ -63,8 +65,50 @@ def pinn_figures(sel):
     print("wrote PINN field comparison + attention figures")
 
 
+def state_overlay(spec):
+    """spec 'CASE:STATE_PT': start / target / last / best-feasible shapes of a Re 1000 optimizer checkpoint -> overlay_<case>.png."""
+    import matplotlib.pyplot as plt
+    from aeroshape.core.config import load_config
+    from aeroshape.geometry.nurbs import NURBSAirfoil
+    from aeroshape.optimization.kkt_optimizer import AugmentedLagrangianOptimizer
+    case, pt = spec.split(":", 1)
+    b5, o6 = _load("bench05", "05_run_4way_benchmark.py"), _load("opt06", "06_optimize_case.py")
+    cfg = load_config(b5.CASES[int(case)], "dev", [])
+    g = cfg.geometry
+    nurbs = NURBSAirfoil(k=g.k, degree=g.degree, M=g.M, mode=g.mode, dtype=torch.float32)
+    rec = torch.load(ROOT / pt, weights_only=False)["records"]
+    # cl_ref: newest cached LBM reference for this case's AoA (written by 06's lbm_cl_ref); no LBM run here
+    refs = sorted((ROOT / "runs" / "refs").glob(f"rae2822_re{cfg.case.re:g}_aoa{cfg.case.aoa:g}_*.json"), key=os.path.getmtime)
+    cl_ref = json.loads(refs[-1].read_text())["cl"] if refs and cfg.case.cl_ref == "rae2822@lbm" else cfg.case.cl_ref
+    a_best = AugmentedLagrangianOptimizer.best_alpha.fget(SimpleNamespace(records=rec, cl_ref=cl_ref, o=cfg.optimizer, nurbs=nurbs))
+    best = next(r for r in rec if torch.equal(r["alpha"].reshape(1, -1).to(a_best), a_best))
+    feas = best["viol"] < 1e-3 and (cl_ref is None or abs(best["cl"] - cl_ref) < cfg.optimizer.cl_tol)
+    items = [("start", rec[0]["alpha"], "k", "0.55", 1, "--", 1.0), ("RAE2822 target", o6.shape(nurbs, "rae2822"), None, "k", 5, "--", 2.5),
+             ("last", rec[-1]["alpha"], rec[-1], "C0", 3, "-", 1.4), ("best feasible" if feas else "best L", best["alpha"], best, "C3", 4, "-", 1.4)]
+    fig, ax = plt.subplots(figsize=(9, 4))
+    for name, al, r, col, z, ls, lw in items:
+        r = rec[0] if name == "start" else r
+        lab = name + (f"  CD {r['cd']:.3f}  CL {r['cl']:.3f}" if r else "")
+        x, yu, yl = (t.detach().numpy() for t in nurbs.surface_y(al.reshape(1, -1).float()))
+        ax.plot(x, yu[0], color=col, ls=ls, lw=lw, zorder=z, label=lab)
+        ax.plot(x, yl[0], color=col, ls=ls, lw=lw, zorder=z)
+    ax.margins(y=0.15)
+    ax.set(aspect="equal", title=f"Case {case}: start, last, best feasible, target RAE2822")
+    ax.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
+    fig.savefig(OUT / f"overlay_{case}.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("wrote", OUT / f"overlay_{case}.png")
+
+
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--state-overlay", help="CASE:STATE_PT[,CASE:STATE_PT...]; only draws the overlays")
+    a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
+    if a.state_overlay:
+        for spec in a.state_overlay.split(","):
+            state_overlay(spec)
+        return
     copy_existing()
     sel = json.load(open(ROOT / "runs/pinn_selected.json"))
     pinn_figures(sel)

@@ -89,6 +89,8 @@ At Re 1000 the mean flow is linearly unstable, so iterating the linearized adjoi
 - sign agreement with central differences of the period-averaged drag on ≥ 70% of control points (dev tier);
 - the optimizer's backtracking line search accepting a step in ≥ 80% of cycles.
 
+In this mode `_forward` passes `window_convective_times` so a run with no detectable period returns a long-window mean (never a single snapshot), and `AdjointLBMEvaluator` does not warm-start the adjoint across cycles (the forward still warm-starts).
+
 ## Pitfalls
 
 - Overwritten populations: in the forward step the IBB value replaces the streamed one, so in the transpose the adjoint of the streamed-in value must be zero. Forgetting this is the classic bug; level 1 catches it.

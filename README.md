@@ -15,39 +15,63 @@ Every method's final shape is re-scored by the LBM, so no method is judged by it
   <img src="docs/assets/morph_transformer_pinn.gif" width="32%" alt="Transformer PINN optimisation">
   <img src="docs/assets/diffusion_denoise.gif" width="32%" alt="Guided diffusion denoising">
 </p>
-<p align="center"><sub>Case 1, circle → low-drag airfoil at Re 20. Left: LBM adjoint, 20 cycles. Middle: Transformer PINN with the training-box envelope. Right: guided diffusion denoising, 50 DDIM steps.</sub></p>
+<p align="center"><sub>Case 1, circle → low-drag airfoil at Re 20. Left: LBM adjoint, 51 cycles to convergence. Middle: Transformer PINN with the training-box envelope. Right: guided diffusion denoising, 50 DDIM steps.</sub></p>
 
 ---
 
 ## Results
 
-All numbers are measured on an Apple M4 Pro (MPS) at the `dev` tier unless stated. Nothing here is a projection.
+All numbers are measured at the `dev` tier, on an Apple M4 Pro (MPS) or a RunPod NVIDIA A40 (CUDA) as stated. Nothing here is a projection.
 
 ### Case 1: circle → NACA0012-like, Re 20, AoA 0
 
 The start shape is a circle with $C_D = 2.409$. The thickness constraint comes from the target airfoil.
 
-| Method | $C_D$ (LBM re-score) | Drag reduction | Wall-clock to final shape | Up-front training |
-|---|---|---|---|---|
-| LBM adjoint | 1.396 | **42.1%** | 1376 s (20-cycle cap, still descending) | none |
-| Guided diffusion | 1.408 | 41.6% | **3.9 s** | 13,389 s |
-| Transformer PINN (training-box envelope) | 1.494 | 38.0% | 5.2 s | 13,017 s |
-| MLP PINN (training-box envelope) | 1.547 | 35.8% | 2.0 s | 2,622 s |
-| MLP PINN (no envelope) | 1.835 | 23.8% | 6.0 s | 2,622 s |
+Run on the A40 (`runs/benchmark/dev_c1v2`). The LBM adjoint stopped on its own convergence test (`cd_stalled`) after 51 cycles.
+
+| Method | $C_D$ (LBM re-score) | Drag reduction | Distance to NACA0012 | Wall-clock to final shape | Up-front training |
+|---|---|---|---|---|---|
+| LBM adjoint | **1.135** | **52.9%** | **0.0085** | 8757 s (51 cycles) | none |
+| Guided diffusion | 1.181 | 51.0% | 0.0196 | **4.2 s** | 13,389 s |
+| MLP PINN (training-box envelope) | 1.547 | 35.8% | 0.0951 | 9.6 s | 2,622 s |
+| Transformer PINN (training-box envelope) | 1.637 | 32.0% | 0.1191 | 57.6 s | 13,017 s |
+| Transformer PINN (no envelope) | 1.355 | 43.7% | 0.0660 | 330.6 s | 13,017 s |
+| MLP PINN (no envelope) | 1.858 | 22.9% | 0.1280 | 192.6 s | 2,622 s |
 
 <p align="center">
   <img src="docs/assets/case1_cd_vs_wallclock.png" width="45%" alt="CD vs wall-clock">
   <img src="docs/assets/case1_shapes.png" width="33%" alt="Final shapes">
 </p>
 
-**Finding:** surrogates exploit their own error. Left unconstrained, the MLP PINN optimiser reported $C_D = 0.07$ for a shape the LBM scores at 1.84.
+**Finding:** surrogates exploit their own error. Left unconstrained, the MLP PINN optimiser reported $C_D = 0.011$ for a shape the LBM scores at 1.86.
 
 <p align="center">
   <img src="docs/assets/morph_mlp_pinn_nobox.gif" width="40%" alt="MLP PINN without envelope">
 </p>
 
-- **The envelope:** clamping $\alpha$ to the training-data box fixes most of the error, but not all of it. Inside the box, the Transformer's own $C_D$ is still −0.71.
+- **The envelope:** clamping $\alpha$ to the training-data box fixes most of the error, but not all of it. Inside the box, the Transformer's own $C_D$ is still −1.83.
 - **Diffusion:** it avoids the problem because its samples stay on the data manifold.
+
+### Case 3: NACA2412 → minimum drag at RAE2822 lift, Re 1000, AoA 10
+
+Objective: minimise $C_D$ with $C_L$ held at the LBM value of RAE2822 (0.367) and thickness at least RAE2822's. RAE2822 is a check, not the goal. LBM adjoint on the A40, 20 cycles (`runs/benchmark/dev/case3_adjoint_lbm`).
+
+| | $C_D$ | $C_L$ | Thickness violation | Distance to RAE2822 |
+|---|---|---|---|---|
+| NACA2412 start | 0.184 | 0.473 | – | – |
+| Best feasible shape (cycle 14) | **0.147** (−20%) | 0.367 | 0 | 0.0051 |
+
+<p align="center">
+  <img src="docs/assets/case3_shapes.png" width="70%" alt="Case 3 shapes">
+  <img src="docs/assets/case3_history.png" width="80%" alt="Case 3 drag and lift history">
+</p>
+
+- Drag falls in the first 3 cycles, then holds at 0.145–0.151 while lift oscillates about ±0.04 around the target. The run stopped at its 20-cycle cap, not on a convergence test.
+- The "start" curve in the shape plot is this run's start: the best shape of an earlier run (cycle 2, $C_D$ 0.168).
+
+### Case 2: circle → RAE2822, Re 1000 (not solved yet)
+
+The time-averaged adjoint gives a usable gradient on the Case 3 airfoil (cosine 0.92 against window-mean finite differences) but not on the separated blob of Case 2 (cosine −0.13; MPS and CUDA agree), so the earlier Case 2 run never left the blob. Case 2 now uses a finite-difference gradient (`--evaluator fd_lbm`, $1 + 2n$ LBM solves per cycle); that run is pending. Details: decision G42 in `Plan/raw/gaps_and_decisions.md`; check script `scripts/09_check_re1000_gradient.py`.
 
 ### Solver validation
 
@@ -90,8 +114,9 @@ The start shape is a circle with $C_D = 2.409$. The thickness constraint comes f
 | PINN surrogates, Re 20 | done; Gate 3 passed |
 | Diffusion, Case 1 benchmark | done |
 | PINN v2 (Re 1000 time-averaged) | trained, with a coverage set for the Case 2 start shape |
-| Cases 2–3 (Re 1000, circle/NACA → RAE2822) | **not run yet**; they need the cambered diffusion model |
-| CUDA verification on a cloud GPU | not run yet (`scripts/cuda_check.sh`) |
+| Case 3 (Re 1000, NACA2412 → RAE2822) | LBM adjoint done: −20% $C_D$ at target $C_L$; benchmark rows (PINN, diffusion) pending |
+| Case 2 (Re 1000, circle → RAE2822) | adjoint gradient unusable on the blob (measured); finite-difference run pending |
+| CUDA on a cloud GPU | used on RunPod A40 (Case 1 v2, Case 3); `torch.compile` 0.55 ms vs eager 2.92 ms per LBM step; `scripts/cuda_check.sh` not run as a gate |
 
 ---
 

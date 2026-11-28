@@ -38,10 +38,17 @@ CASES = {1: "case1_circle_to_naca_re20.yaml", 2: "case2_circle_to_rae_re1000.yam
 RUNS = {"adjoint_lbm": ("adjoint_lbm", None), "mlp_pinn": ("mlp_pinn", "pinn_train"), "transformer_pinn": ("transformer_pinn", "pinn_train"),
         "mlp_pinn_nobox": ("mlp_pinn", None), "transformer_pinn_nobox": ("transformer_pinn", None)}
 METHODS = ["adjoint_lbm", "mlp_pinn", "transformer_pinn", "diffusion", "mlp_pinn_nobox", "transformer_pinn_nobox"]
-BOX_ANCHORS = {"mlp_pinn": "data/lbm_anchors/dev/merged_v1v1b.pt",  # v1b MLP: 80 runs (pinn_selected.json)
-               "transformer_pinn": "data/lbm_anchors/dev/merged.pt"}  # v1c Transformer: 110 runs
+HYBRID = "hybrid_transformer_pinn"  # --hybrid only: PINN gradient, LBM line search (evaluator lives in optimization/evaluators.py)
+RUNS[HYBRID] = (HYBRID, "pinn_train")
+BOX_ANCHORS = {1: {"mlp_pinn": "data/lbm_anchors/dev/merged_v1v1b.pt",  # v1b MLP: 80 runs (pinn_selected.json)
+                   "transformer_pinn": "data/lbm_anchors/dev/merged.pt"},  # v1c Transformer: 110 runs
+               2: dict.fromkeys(("mlp_pinn", "transformer_pinn"), "data/lbm_anchors/dev_v2/merged_v2v2b.pt")}
+BOX_ANCHORS[3] = BOX_ANCHORS[2]
+TARGET_NAME = {1: "NACA0012", 2: "RAE2822", 3: "RAE2822"}
+CAMBERED_DIFFUSION = "runs/diffusion_v2_dev/ckpt/diffusion.pt"
 LABEL = {"adjoint_lbm": "LBM adjoint", "mlp_pinn": "MLP-PINN", "transformer_pinn": "Transformer-PINN",
-         "diffusion": "Guided diffusion", "mlp_pinn_nobox": "MLP-PINN (no envelope)", "transformer_pinn_nobox": "Transformer-PINN (no envelope)"}
+         "diffusion": "Guided diffusion", "mlp_pinn_nobox": "MLP-PINN (no envelope)", "transformer_pinn_nobox": "Transformer-PINN (no envelope)",
+         HYBRID: "Hybrid Transformer-PINN (LBM line search)"}
 N_SAMPLES = 8
 
 
@@ -52,31 +59,46 @@ def _load(name, file):
     return m
 
 
+def resume_args(resume, d):
+    """Sub-run with a per-cycle state.pt but no results.json continues (06 --resume) instead of restarting."""
+    return ["--resume"] if resume and (d / "state.pt").exists() and not (d / "results.json").exists() else []
+
+
 def _abs(p):
     return Path(p) if Path(p).is_absolute() else ROOT / p
 
 
 def models_for(case, a):
-    """Checkpoints and training times for the case; cases 2-3 need PINN v2 and a cambered diffusion model (not built yet)."""
+    """Checkpoints, training times and (cases 2-3) the accepted diffusion guidance pair for the case."""
     sel = json.loads((ROOT / "runs/pinn_selected.json").read_text())
-    if case > 1:
+    if case == 1:
+        dck, mk, tk = _abs(a.diffusion_ckpt), ("mlp", "transformer"), None
+    else:
         if "mlp_v2" not in sel or "transformer_v2" not in sel:
-            raise SystemExit(f"case {case} needs PINN v2 (runs/pinn_selected.json keys mlp_v2 / transformer_v2) and a cambered diffusion "
-                             f"model; neither exists yet. Only --cases 1 can run.")
-        raise SystemExit(f"case {case}: v2 models are listed but the cambered diffusion model wiring is not implemented")
-    dck = _abs(a.diffusion_ckpt)
+            raise SystemExit(f"case {case} needs PINN v2: runs/pinn_selected.json lacks mlp_v2 / transformer_v2")
+        dck, mk = _abs(CAMBERED_DIFFUSION), ("mlp_v2", "transformer_v2")
     if not dck.exists():
-        raise SystemExit(f"diffusion checkpoint not found: {dck}")
+        raise SystemExit(f"{'cambered ' if case > 1 else ''}diffusion checkpoint not found: {dck}")
     dres = json.loads((dck.parents[1] / "results.json").read_text())
-    return {"mlp_pinn": _abs(sel["mlp"]["checkpoint"]), "transformer_pinn": _abs(sel["transformer"]["checkpoint"]), "diffusion": dck,
-            "train_s": {"mlp_pinn": sel["mlp"]["wall_s"], "transformer_pinn": sel["transformer"]["wall_s"],
-                        "diffusion_only": dres["train"]["wall_s"]}}
+    # G36: the best valid pair on the beyond-range targets (04 writes it as chosen_pair)
+    pair = (dres.get("chosen_pair") or ((dres.get("acceptance") or {}).get("beyond_range") or {}).get("best_pair")) if case > 1 else None
+    return {"mlp_pinn": _abs(sel[mk[0]]["checkpoint"]), "transformer_pinn": _abs(sel[mk[1]]["checkpoint"]), "diffusion": dck, "diffusion_pair": pair,
+            "train_s": {"mlp_pinn": sel[mk[0]]["wall_s"], "transformer_pinn": sel[mk[1]]["wall_s"], "diffusion_only": dres["train"]["wall_s"]}}
+
+
+def check_box_dim(anchor_file, cfg):
+    """The box anchors' alpha width must equal the case's NURBS D (8 symmetric, 16 cambered)."""
+    g = cfg.geometry
+    D = NURBSAirfoil(k=g.k, degree=g.degree, M=g.M, mode=g.mode, dtype=torch.float32).D
+    w = load_ckpt(_abs(anchor_file), "cpu")["alpha"].shape[1]
+    if w != D:
+        raise ValueError(f"box anchors {anchor_file} have alpha width {w}, but the {g.mode} case needs D={D}")
 
 
 def up_front(method, train_s):
     """Training wall-clock (s) behind the method; diffusion also needs the Transformer-PINN for guidance. Data generation not included."""
     return 0.0 if method == "adjoint_lbm" else train_s["transformer_pinn"] + train_s["diffusion_only"] if method == "diffusion" \
-        else train_s[method.removesuffix("_nobox")]
+        else train_s["transformer_pinn" if method == HYBRID else method.removesuffix("_nobox")]
 
 
 def latency(model, nurbs, alpha, cond, reps=20):
@@ -143,14 +165,15 @@ def fmt(v, f="{:.4g}"):
     return "-" if v is None else f.format(v)
 
 
-def write_md(results, path):
+def write_md(results, path, target_names=None):
     cols = [("method", "Method", "{}"), ("cd_lbm", "CD (LBM)", "{:.4f}"), ("cl_lbm", "CL (LBM)", "{:.4f}"),
             ("drag_reduction", "Drag red.", "{:.2%}"), ("wall_s", "Wall (s)", "{:.1f}"), ("up_front_s", "Up-front (s)", "{:.0f}"),
             ("iterations", "Iters", "{}"), ("viol", "Max t viol.", "{:.2e}"), ("cl_err", "abs(CL-CL_ref)", "{:.2e}"),
-            ("dist_to_target", "Dist to NACA0012", "{:.4f}"), ("latency_s", "Latency (s)", "{:.4g}"), ("cd_own", "CD (own, last)", "{:.4f}"),
+            ("dist_to_target", "Dist to target", "{:.4f}"), ("latency_s", "Latency (s)", "{:.4g}"), ("cd_own", "CD (own, last)", "{:.4f}"),
             ("peak_mem_bytes", "Peak mem (MB)", None)]
     lines = []
     for case, rows in results["cases"].items():
+        cols[-4] = (cols[-4][0], f"Dist to {(target_names or {}).get(str(case), 'NACA0012')}", cols[-4][2])
         lines += [f"## Case {case} (tier {results['tier']}, device {results['device']})", "",
                   "| " + " | ".join(c[1] for c in cols) + " |", "|" + "---|" * len(cols)]
         for r in rows:
@@ -166,18 +189,26 @@ def write_md(results, path):
     path.write_text("\n".join(lines) + "\n")
 
 
+def plot_shapes(path, case, shapes, nurbs):
+    """shapes: {name: alpha [D]}; start thin grey dashed, target thick black dashed on top, legend outside the axes."""
+    fig, ax = plt.subplots(figsize=(9, 4))
+    for name, al in shapes.items():
+        x, yu, yl = (t.detach().cpu().numpy() for t in nurbs.surface_y(al.reshape(1, -1).to(nurbs.x_ctrl)))
+        kw = (dict(color="0.55", ls="--", lw=1, zorder=2) if name == "start" else dict(color="k", ls="--", lw=2.5, zorder=5) if name == "target"
+              else dict(lw=1.4, zorder=3))
+        ln, = ax.plot(x, yu[0], label=LABEL.get(name, name), **kw)
+        ax.plot(x, yl[0], **{**kw, "color": ln.get_color()})
+    ax.margins(y=0.15)
+    ax.set(aspect="equal", title=f"Case {case}: start, final shapes, target {TARGET_NAME[case]}")
+    ax.legend(fontsize=7, loc="center left", bbox_to_anchor=(1.02, 0.5))
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def figures(out, case, c, rows, shapes, hist, nurbs):
     """shapes: {name: alpha [D]}; hist: {method: history dict}."""
     (out / "fig").mkdir(exist_ok=True)
-    fig, ax = plt.subplots(figsize=(8, 3))
-    for name, al in shapes.items():
-        x, yu, yl = (t.detach().cpu().numpy() for t in nurbs.surface_y(al.reshape(1, -1).to(nurbs.x_ctrl)))
-        ax.plot(x, yu[0], label=LABEL.get(name, name), ls="--" if name in ("start", "target") else "-")
-        ax.plot(x, yl[0], color=ax.lines[-1].get_color(), ls=ax.lines[-1].get_linestyle())
-    ax.set(aspect="equal", title=f"Case {case}: start, final shapes, reference")
-    ax.legend(fontsize=7)
-    fig.savefig(out / "fig" / f"shapes_case{case}.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    plot_shapes(out / "fig" / f"shapes_case{case}.png", case, shapes, nurbs)
     fig, ax = plt.subplots(figsize=(5.5, 3.8))
     for r in rows:
         ax.scatter(r["wall_s"], r["cd_lbm"], label=LABEL[r["method"]], zorder=3)
@@ -196,7 +227,8 @@ def main(argv=None):
     ap.add_argument("--tier", default="dev", choices=["smoke", "dev", "full"])
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     ap.add_argument("--cases", type=int, nargs="+", default=[1], choices=[1, 2, 3])
-    ap.add_argument("--resume", action="store_true", help="skip sub-runs that already have a results.json")
+    ap.add_argument("--hybrid", action="store_true", help=f"also run {HYBRID} (PINN gradient, LBM line search)")
+    ap.add_argument("--resume", action="store_true", help="skip sub-runs that already have a results.json; continue ones with a state.pt from their last cycle")
     ap.add_argument("--out", default=None)
     ap.add_argument("--diffusion-ckpt", default="runs/diffusion_dev/ckpt/diffusion.pt")
     ap.add_argument("-o", "--set", action="append", default=[], dest="sets", help="config override passed to every sub-run")
@@ -205,23 +237,32 @@ def main(argv=None):
     opt06 = _load("opt06", "06_optimize_case.py")
     device = get_device(a.device)
     models = {c: models_for(c, a) for c in a.cases}  # fail before any work
+    runs = {k: v for k, v in RUNS.items() if k != HYBRID or a.hybrid}
+    methods = METHODS + [HYBRID] * a.hybrid
     results = {"tier": a.tier, "device": device.type, "overrides": a.sets, "cases": {}, "failures": {}}
     for case in a.cases:
         m, case_file = models[case], CASES[case]
-        cfg = load_config(case_file, a.tier, a.sets)
+        pair = m["diffusion_pair"]
+        gsets = [f"diffusion.guide_scale={pair['guide_scale']}", f"diffusion.cfg_scale={pair['cfg_scale']}"] if pair else []
+        if case > 1:
+            print(f"case{case} diffusion guidance: {'04 results.json chosen_pair / beyond_range' if pair else 'config fallback'}", flush=True)
+        cfg = load_config(case_file, a.tier, gsets + a.sets)  # user -o wins
         c = cfg.case
         g = cfg.geometry
         done, hist, lat = {}, {}, {}
         seed_everything(cfg.seed)
-        for meth, (ev, box) in RUNS.items():
+        for meth, (ev, box) in runs.items():
             d = out / f"case{case}_{meth}"
             if not (a.resume and (d / "results.json").exists()):
                 cycles = cfg.optimizer.max_cycles * (1 if ev == "adjoint_lbm" else 10)
-                args = ["--case", case_file, "--evaluator", ev, "--tier", a.tier, "--device", a.device, "--out", str(d),
+                args = resume_args(a.resume, d) + ["--case", case_file, "--evaluator", ev, "--tier", a.tier, "--device", a.device, "--out", str(d),
                         *sum((["--set", s] for s in a.sets), []), "--set", f"optimizer.max_cycles={cycles}"]
-                args += ["--ckpt", str(m[ev])] if ev != "adjoint_lbm" else []
-                args += ["--set", f"optimizer.box={box}", "--box-anchors", BOX_ANCHORS[ev]] if box else []
+                ck = "transformer_pinn" if ev == HYBRID else ev
+                args += ["--ckpt", str(m[ck])] if ev != "adjoint_lbm" else []
                 try:
+                    if box:
+                        check_box_dim(BOX_ANCHORS[min(case, 2)][ck], cfg)
+                        args += ["--set", f"optimizer.box={box}", "--box-anchors", BOX_ANCHORS[min(case, 2)][ck]]
                     opt06.main(args)
                 except (Exception, SystemExit):
                     results["failures"][f"case{case}_{meth}"] = traceback.format_exc()
@@ -232,11 +273,11 @@ def main(argv=None):
             (out / "histories").mkdir(exist_ok=True)
             shutil.copy(d / "history.pt", out / "histories" / f"case{case}_{meth}.pt")
         nurbs = NURBSAirfoil(k=g.k, degree=g.degree, M=g.M, mode=g.mode, device=device, dtype=torch.float32)
-        for meth in (k for k in RUNS if k != "adjoint_lbm"):
+        for meth in (k for k in runs if k != "adjoint_lbm"):
             if meth in done:
                 d = out / f"case{case}_{meth}"
                 if not (a.resume and (d / "latency.json").exists()):
-                    model = opt06.load_model(cfg, nurbs, RUNS[meth][0], m[RUNS[meth][0]], device)
+                    model = opt06.load_model(cfg, nurbs, "transformer_pinn" if meth == HYBRID else RUNS[meth][0], m["transformer_pinn" if meth == HYBRID else RUNS[meth][0]], device)
                     (d / "latency.json").write_text(json.dumps(
                         {"latency_s": latency(model, nurbs, opt06.shape(nurbs, c.start).reshape(1, -1), Condition(c.re, c.aoa))}))
                 lat[meth] = json.loads((d / "latency.json").read_text())["latency_s"]
@@ -254,14 +295,14 @@ def main(argv=None):
             results["failures"][f"case{case}_diffusion"] = "needs method 1's final CD as the target"
         if "adjoint_lbm" not in done:
             continue
-        rows = [row(k, done[k], done["adjoint_lbm"], lat.get(k), m["train_s"]) for k in METHODS if k in done]
+        rows = [row(k, done[k], done["adjoint_lbm"], lat.get(k), m["train_s"]) for k in methods if k in done]
         results["cases"][case] = rows
         shapes = {"start": opt06.shape(nurbs, c.start), "target": opt06.shape(nurbs, c.target),
                   **{k: torch.tensor(done[k]["alpha_final"]) for k in done}}
         figures(out, case, c, rows, shapes, hist, nurbs)
         results[f"case{case}_target_cd"] = done["adjoint_lbm"]["cd_final_lbm"]
     (out / "results.json").write_text(json.dumps(results, indent=2))
-    write_md(results, out / "results.md")
+    write_md(results, out / "results.md", {str(c): TARGET_NAME[c] for c in a.cases})
     print("wrote", out / "results.json")
     return 1 if results["failures"] else 0
 

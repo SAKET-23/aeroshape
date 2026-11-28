@@ -24,7 +24,11 @@ lbm:
   average_periods: 4
   record_every: 50
   transient: 30           # convective times before unsteady period detection starts
+  transient_warm: 5       # same, for a warm-started unsteady forward run (wake already developed)
   window_convective_times: 20  # unsteady runs with no detectable period: mean over this many convective times (W >= 20)
+  compile: false          # torch.compile the forward step in run() (opt-in; adjoint path stays eager)
+  cuda_graph: false       # CUDA only: replay graph_steps-step CUDA graphs between record steps (forward run() only)
+  graph_steps: 49         # <= record_every-1 (run() clamps)
   perturb: 0.0            # init_state transverse kick (fraction of U_lb); unsteady cases set 0.1
 
 adjoint:
@@ -111,10 +115,12 @@ optimizer:
   eta: 0.05
   backtrack: 0.5
   rho_al: 10.0
+  fd_delta: 5.0e-3        # fd_lbm evaluator: central-difference step on each free control point
   mu0: 10.0
   mu_max: 1.0e+4  # PyYAML needs the exponent sign, else this loads as a string
   kkt_tol: 1.0e-4
   cl_tol: 1.0e-2
+  lam_step_max: 0.5       # max |change| of the CL multiplier lam per cycle
   g_cap: 0.02             # max control-point move per cycle (chord units), after the eta scaling (H1)
   cd_rtol: 1.0e-4         # stop when relative CD change < cd_rtol for 3 cycles; 0 disables
   box: null               # G37: pinn_train clamps alpha to the PINN train-split min/max box after each step

@@ -5,3 +5,4 @@ geometry: {mode: cambered, k: 8}
 lbm: {collision: trt, outlet: extrapolate, sponge: {enabled: true}, perturb: 0.1, trt_magic: 0.001}  # F1: Lambda 3/16 blows up at tau ~ 0.504 (see d2q9 tests)
 adjoint: {mode: time_averaged, impl: vjp}
 optimizer: {g_cap: 0.01}
+diffusion: {guide_scale: 3.0, cfg_scale: 0.0}  # fallback; 05 prefers the accepted pair in the cambered diffusion run results.json

@@ -118,6 +118,47 @@ def detect_period(cl, record_every, n_consistent=3, tol=0.05, decay=0.5):
     return None
 
 
+_COMPILE_FAILED = False  # process-wide: after one failed probe, later run() calls go straight to eager
+GRAPH_REPLAYS = 0  # CUDA-graph replays so far (test hook)
+_COMPILED = {}  # (id(geom), id(params), outlet) -> (geom, params, fn); holds refs so ids stay valid
+
+
+def _compiled_step(geom, params, outlet):
+    """torch.compile of the per-step fn (default mode: reduce-overhead's CUDA graphs would alias returned buffers; the
+    default inductor fusion already removes the ~100 launches). Eager fallback with one warning if compile raises."""
+    key = (id(geom), id(params), outlet)
+    if key not in _COMPILED:
+        fn = torch.compile(lambda f: step(f, geom, params, outlet))
+        _COMPILED.clear()  # one entry only: old geometries must be released
+        _COMPILED[key] = (geom, params, fn)
+    return _COMPILED[key][2]
+
+
+class _Graph:
+    """CUDA graph of m eager steps, static in/out buffers (grid, links, params fixed for the run)."""
+
+    def __init__(self, f, geom, params, outlet, m):
+        def body(x):
+            for _ in range(m):
+                x, _ = step(x, geom, params, outlet)
+            return x
+        self.m, self.inp = m, f.clone()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                body(f.clone())
+        torch.cuda.current_stream().wait_stream(s)
+        self.g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.g):
+            self.out = body(self.inp)
+
+    def __call__(self, f):
+        self.inp.copy_(f)
+        self.g.replay()
+        return self.out.clone()
+
+
 def _state(f, n):
     rho, ux, uy = moments(f)
     return FlowState(f, rho, ux, uy, n)
@@ -126,9 +167,12 @@ def _state(f, n):
 @torch.no_grad()
 def run(f0, geom, params, n_steps=None, mode="steady", record_every=50, callback=None, force_fn=None,
         outlet="fixed", steady_tol=1e-6, max_convective_times=60, transient=30, average_periods=4, require_period=False,
-        window_convective_times=0):
+        window_convective_times=0, compile=False, cuda_graph=False, graph_steps=50):
     """force_fn(f_col, f_next, geom, params) -> (cd, cl) 0-dim tensors; None = no force tracking, fixed step count.
-    shortcut: forces recorded every record_every steps only (not every step in the last convective time)."""
+    shortcut: forces recorded every record_every steps only (not every step in the last convective time).
+    compile / cuda_graph (opt-in, forward only): torch.compile the step; replay CUDA graphs of graph_steps steps between
+    record steps (CUDA only, else ignored). The f_sum averaging phase stays per-step (it accumulates every step)."""
+    global _COMPILE_FAILED, GRAPH_REPLAYS
     K = round(params.N / params.u_lb)
     cap_steps = max_convective_times * K * (1 + average_periods) + round(window_convective_times * K)
     dev, dt = f0.device, f0.dtype
@@ -137,8 +181,21 @@ def run(f0, geom, params, n_steps=None, mode="steady", record_every=50, callback
     f, n, k = f0, 0, 0
     f_sum, n_sum = None, 0
 
+    stepper = lambda f: step(f, geom, params, outlet)  # noqa: E731
+    if compile and not _COMPILE_FAILED:
+        try:
+            stepper = _compiled_step(geom, params, outlet)
+            stepper(f0)  # compile errors surface lazily, on the first call
+        except Exception as e:  # noqa: BLE001
+            _COMPILE_FAILED = True
+            warnings.warn(f"torch.compile failed ({type(e).__name__}: {str(e)[:200]}); running eager", RuntimeWarning)
+            stepper = lambda f: step(f, geom, params, outlet)  # noqa: E731
+    graph = [None]
+    graph_steps = min(graph_steps, record_every - 1)  # a chunk must fit the record-free gap, else the graph never fires
+    use_graph = cuda_graph and f0.is_cuda and graph_steps > 0
+
     def advance(f, n, k):
-        f_next, f_col = step(f, geom, params, outlet)
+        f_next, f_col = stepper(f)
         n += 1
         if n % record_every == 0:
             if force_fn is not None:
@@ -149,15 +206,28 @@ def run(f0, geom, params, n_steps=None, mode="steady", record_every=50, callback
                 callback(n, f_next)
         return f_next, n, k
 
+    def advance_n(f, n, k, cnt):
+        """cnt steps; chunks free of record steps are replayed as a CUDA graph."""
+        end = n + cnt
+        while n < end:
+            free = min(end, n + record_every - n % record_every - 1) - n  # steps before the next record step
+            if use_graph and free >= graph_steps:
+                if graph[0] is None:
+                    graph[0] = _Graph(f, geom, params, outlet, graph_steps)
+                f, n = graph[0](f), n + graph_steps
+                GRAPH_REPLAYS += 1
+            else:
+                f, n, k = advance(f, n, k)
+        return f, n, k
+
     converged, period = False, None
     if force_fn is None:
-        for _ in range(n_steps if n_steps is not None else max_convective_times * K):
-            f, n, k = advance(f, n, k)
+        f, n, k = advance_n(f, n, k, n_steps if n_steps is not None else max_convective_times * K)
         converged = n_steps is not None
     elif mode == "steady":
         lag, limit = max(1, round(K / record_every)), n_steps or max_convective_times * K
         while n < limit and not converged:
-            f, n, k2 = advance(f, n, k)
+            f, n, k2 = advance_n(f, n, k, min(record_every - n % record_every, limit - n))
             if k2 > k:
                 k = k2
                 if k > lag:  # one host sync per log interval
@@ -167,8 +237,7 @@ def run(f0, geom, params, n_steps=None, mode="steady", record_every=50, callback
     else:
         limit = n_steps or max_convective_times * K
         n_tr = min(transient * K, limit)
-        while n < n_tr:
-            f, n, k = advance(f, n, k)
+        f, n, k = advance_n(f, n, k, n_tr)
         k_tr = k  # no force-based period detection before the transient ends (start-up wiggles)
         while True:
             period = detect_period(hcl[k_tr:k].cpu(), record_every)
@@ -176,8 +245,7 @@ def run(f0, geom, params, n_steps=None, mode="steady", record_every=50, callback
                 break
             if n >= limit:
                 break
-            for _ in range(K):
-                f, n, k = advance(f, n, k)
+            f, n, k = advance_n(f, n, k, K)
         if period:
             k0, f_sum = k, torch.zeros_like(f)
             for _ in range(average_periods * period):

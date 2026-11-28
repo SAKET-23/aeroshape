@@ -212,3 +212,33 @@ def test_unsteady_warm_start_is_re_kicked(monkeypatch):  # M5
 def test_gmres_zero_rhs():  # L4
     x, hist, n = AS._gmres(lambda v: v, torch.zeros(5, dtype=F64), torch.zeros(5, dtype=F64), 1e-8, 10)
     assert x.abs().max() == 0 and n == 0
+
+
+def test_forward_uses_transient_warm_only_with_f0(monkeypatch):  # L2
+    _, _, p, g, f = base()
+    cfg = load_config(None, "dev", OV + ["lbm.transient=30", "lbm.transient_warm=5"])
+    seen = []
+    monkeypatch.setattr(AS.S, "run", lambda f0, g, p, **kw: (seen.append(kw["transient"]), (_ for _ in ()).throw(StopIteration))[0])
+    for f0 in (None, f):
+        with pytest.raises(StopIteration):
+            AS._forward(g, p, cfg, "time_averaged", f0)
+    assert seen == [30, 5]
+
+
+def test_forward_window_kwarg_only_in_unsteady(monkeypatch):
+    _, _, p, g, f = base()
+    cfg = load_config(None, "dev", OV + ["lbm.window_convective_times=7"])
+    seen = []
+    monkeypatch.setattr(AS.S, "run", lambda f0, g, p, **kw: (seen.append(kw.get("window_convective_times", 0)),
+                                                              (_ for _ in ()).throw(StopIteration))[0])
+    for mode in ("steady", "time_averaged"):
+        with pytest.raises(StopIteration):
+            AS._forward(g, p, cfg, mode, f)
+    assert seen == [0, 7]
+
+
+def test_cambered_positive_aoa_gives_positive_cl():  # sign convention of the force path
+    n = NURBSAirfoil(k=8, dtype=F64)
+    from aeroshape.geometry.reference_shapes import naca4_alpha
+    _, cl, _ = lbm_value(naca4_alpha(n, "2412"), n, Condition(20, 5), CFG, N)
+    assert float(cl) > 0

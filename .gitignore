@@ -17,3 +17,7 @@ docs/*.pdf
 .ignore
 .trail/
 scripts/__pycache__/
+
+# RunPod account action log (local only)
+docs/runpod_log.md
+docs/runpod_issues.md

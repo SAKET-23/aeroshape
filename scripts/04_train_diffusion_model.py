@@ -1,7 +1,9 @@
-"""WP 17: physics-guided shape diffusion (Plan/06_training/diffusion_training.md), symmetric k = 8, Re 20, AoA 0 only.
-uv run python scripts/04_train_diffusion_model.py --tier dev --device mps --out runs/diffusion_dev
-Writes <out>/{config.yaml,results.json,ckpt/diffusion.pt,fig/} and data/diffusion_shapes/<tier>_symmetric.pt.
-Scope: the selected PINN (v1c) is trained at Re 20-40, AoA 0 on symmetric shapes, so cambered / Re 1000 waits for PINN v2."""
+"""WP 17: physics-guided shape diffusion (Plan/06_training/diffusion_training.md).
+--regime v1 (default): symmetric k = 8, Re 20, AoA 0 only (PINN v1c).
+  uv run python scripts/04_train_diffusion_model.py --tier dev --device mps --out runs/diffusion_dev
+--regime v2: cambered k = 8 (12 free entries), Re 1000, AoA drawn per shape from {0, 10} deg (PINN transformer_v2).
+  uv run python scripts/04_train_diffusion_model.py --regime v2 --tier dev --device cuda --out runs/diffusion_v2_dev
+Writes <out>/{config.yaml,results.json,ckpt/diffusion.pt,fig/} and data/diffusion_shapes/<tier>_{symmetric,cambered}.pt."""
 import argparse
 import copy
 import hashlib
@@ -25,7 +27,7 @@ from aeroshape.diffusion.denoiser import ShapeDenoiser  # noqa: E402
 from aeroshape.diffusion.guided_shape_diffusion import GuidedSampler, diffusion_loss  # noqa: E402
 from aeroshape.diffusion.schedule import CosineSchedule  # noqa: E402
 from aeroshape.geometry.nurbs import NURBSAirfoil  # noqa: E402
-from aeroshape.geometry.reference_shapes import circle_alpha, is_valid, lhs_shapes, naca4_alpha, perturb  # noqa: E402
+from aeroshape.geometry.reference_shapes import circle_alpha, is_valid, lhs_shapes, naca4_alpha, perturb, rae2822_alpha  # noqa: E402
 from aeroshape.optimization.evaluators import LBMScoreEvaluator  # noqa: E402
 from aeroshape.pinn.stress_integrator import surface_forces  # noqa: E402
 from aeroshape.visualization.plots import plot_denoise_gif, plot_guidance_sweep, plot_shapes  # noqa: E402
@@ -33,6 +35,7 @@ from aeroshape.visualization.plots import plot_denoise_gif, plot_guidance_sweep,
 ROOT = Path(__file__).resolve().parents[1]
 COND = Condition(20.0, 0.0)
 ANCHORS = "data/lbm_anchors/dev/merged.pt"
+V2_ANCHORS, V2_AOA_DEG, V2_RE = "data/lbm_anchors/dev_v2/merged_v2v2b.pt", (0.0, 10.0), 1000.0
 LABEL_CHUNK = 128
 
 
@@ -59,14 +62,17 @@ def _forces(pinn, nurbs, alpha, pc):
     return cd.detach(), cl.detach()
 
 
-def pinn_labels(pinn, nurbs, alpha):
-    """-> cond [S, 4] = [CL, CD, log Re, AoA rad] from the frozen PINN, batched."""
-    pc = COND.as_tensor(alpha.device).repeat(alpha.shape[0], 1)
+def pinn_labels(pinn, nurbs, alpha, aoa_deg=None, re=None):
+    """-> cond [S, 4] = [CL, CD, log Re, AoA rad] from the frozen PINN, batched. aoa_deg [S] (default 0) is each shape's own AoA."""
+    S, dev = alpha.shape[0], alpha.device
+    aoa = torch.zeros(S, device=dev) if aoa_deg is None else torch.as_tensor(aoa_deg, dtype=torch.float32, device=dev).expand(S)
+    lre = torch.full((S,), math.log(COND.re if re is None else re), device=dev)
+    pc = torch.stack([lre, torch.deg2rad(aoa).sin(), torch.deg2rad(aoa).cos()], 1)
     out = []
     for i in range(0, alpha.shape[0], LABEL_CHUNK):
         out.append(_forces(pinn, nurbs, alpha[i:i + LABEL_CHUNK], pc[i:i + LABEL_CHUNK]))  # graph freed on return (MPS memory cliff)
     cd, cl = torch.cat([o[0] for o in out]), torch.cat([o[1] for o in out])
-    return torch.stack([cl, cd, pc[:, 0], torch.zeros_like(cd)], 1)
+    return torch.stack([cl, cd, pc[:, 0], torch.deg2rad(aoa)], 1)
 
 
 def random_blends(chk, ref, m, seed):
@@ -78,16 +84,37 @@ def random_blends(chk, ref, m, seed):
     return perturb((1 - w) * circ + w * tgt[torch.randint(0, tgt.shape[0], (m,), generator=g)], m, 0.015, 0.3, seed + 1, ref)
 
 
-def make_shapes(cfg, A, ref):
+def random_blends_v2(chk, ref, m, seed):
+    """[m, D] cambered layout: {circle, ellipse t in 0.6..1.1} <-> {RAE2822, NACA2412, NACA0012} blends, w in 0.05..0.95, + smooth perturbation."""
+    g = torch.Generator().manual_seed(seed)
+    src = torch.cat([circle_alpha(ref), *(chk._ellipse(ref, float(t)) for t in torch.linspace(0.6, 1.1, 6))])
+    tgt = torch.cat([rae2822_alpha(ref), naca4_alpha(ref, "2412"), naca4_alpha(ref, "0012")])
+    w = 0.05 + 0.9 * torch.rand(m, 1, generator=g, dtype=torch.float64)
+    a = (1 - w) * src[torch.randint(0, src.shape[0], (m,), generator=g)] + w * tgt[torch.randint(0, tgt.shape[0], (m,), generator=g)]
+    return perturb(a, m, 0.015, 0.3, seed + 1, ref)
+
+
+def make_shapes(cfg, A, ref, regime="v1"):
     """G35: mix of the 'diffusion' LHS family, v1c generators (03b v1c_shapes at many seeds) and random blends, screened by is_valid and
-    to the PINN's training alpha box (coordinate-wise min/max of its train split)."""
+    to the PINN's training alpha box (coordinate-wise min/max of its train split). v2: cambered LHS, v2b_shapes (02) and cambered blends."""
     chk = _load("chk", "03b_pinn_checks.py")
     tr = A["alpha"][A["split"] == 0].double()
     lo, hi = tr.min(0).values, tr.max(0).values
     n = cfg.diffusion.n_shapes
-    parts = [lhs_shapes(ref, n, cfg.seed, family="diffusion").double(),
-             torch.cat([chk.v1c_shapes(ref, seed=cfg.seed + 11 * k) for k in range(max(1, math.ceil(n / 60)))]).double(),
-             random_blends(chk, ref, n, cfg.seed)]
+    parts = [lhs_shapes(ref, n, cfg.seed, family="diffusion").double()]
+    if regime == "v2":
+        g02 = _load("g02", "02_generate_lbm_dataset.py")
+        def v2b(seed):  # v2b_shapes raises on some seeds (an invalid shape or the exact circle): skip those seeds
+            try:
+                return g02.v2b_shapes(ref, seed=seed)
+            except ValueError:
+                return None
+        got = [x for x in (v2b(cfg.seed + 11 * k) for k in range(max(1, math.ceil(n / 24)))) if x is not None]
+        parts += [torch.cat(got).double() if got else torch.empty(0, ref.D, dtype=torch.float64),
+                  random_blends_v2(chk, ref, n, cfg.seed)]
+    else:
+        parts += [torch.cat([chk.v1c_shapes(ref, seed=cfg.seed + 11 * k) for k in range(max(1, math.ceil(n / 60)))]).double(),
+                  random_blends(chk, ref, n, cfg.seed)]
     cand = torch.cat(parts)
     cand = cand[torch.randperm(cand.shape[0], generator=torch.Generator().manual_seed(cfg.seed))]
     valid = is_valid(ref, cand)
@@ -107,15 +134,18 @@ def nn_dist(ref, A, B, skip_self=False):
     return d.sort(1).values[:, int(skip_self)]
 
 
-def lbm_check(cfg, alpha, cond, nurbs, n):
-    """PINN vs LBM CD / CL on n random shapes (G13)."""
+def lbm_check(cfg, alpha, cond, nurbs, n, regime="v1"):
+    """PINN vs LBM CD / CL on n random shapes (G13). v2: Re 1000 at each shape's own AoA, N = cells_per_d_high_re, time-averaged
+    (cfg carries the V2_CASE overrides)."""
     if n == 0:
         return None
     idx = torch.randperm(alpha.shape[0], generator=torch.Generator().manual_seed(cfg.seed))[:n]
     rows = []
     for i in idx.tolist():
-        cd, cl = LBMScoreEvaluator(cfg, nurbs, None).value(alpha[i:i + 1], COND)
+        c, N = (COND, None) if regime == "v1" else (Condition(V2_RE, math.degrees(float(cond[i, 3]))), cfg.lbm.cells_per_d_high_re)
+        cd, cl = LBMScoreEvaluator(cfg, nurbs, N).value(alpha[i:i + 1], c)
         rows.append((float(cond[i, 1]), float(cd), float(cond[i, 0]), float(cl)))
+        print(f"lbm_check {len(rows)}/{n} aoa {c.aoa_deg:.0f}: CD pinn {rows[-1][0]:.4f} lbm {rows[-1][1]:.4f} | CL pinn {rows[-1][2]:.4f} lbm {rows[-1][3]:.4f}", flush=True)
     t = torch.tensor(rows, dtype=torch.float64)
     rel = ((t[:, 0] - t[:, 1]).abs() / t[:, 1].abs())
     return {"n": n, "cd_rel_err_mean": float(rel.mean()), "cd_rel_err_max": float(rel.max()), "cd_rel_err_median": float(rel.median()),
@@ -223,10 +253,11 @@ def main(argv=None):
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     ap.add_argument("--out", default=None)
     ap.add_argument("-o", "--set", action="append", default=[], dest="sets")
-    ap.add_argument("--anchors", default=ANCHORS)
-    ap.add_argument("--pinn-ckpt", default=None, help="default: runs/pinn_selected.json[transformer][checkpoint]")
+    ap.add_argument("--regime", default="v1", choices=["v1", "v2"], help="v1: symmetric Re 20 AoA 0; v2: cambered Re 1000 AoA {0, 10}")
+    ap.add_argument("--anchors", default=None, help="default: v1 data/lbm_anchors/dev/merged.pt, v2 data/lbm_anchors/dev_v2/merged_v2v2b.pt")
+    ap.add_argument("--pinn-ckpt", default=None, help="default: runs/pinn_selected.json[transformer | transformer_v2][checkpoint]")
     ap.add_argument("--eval-from", default=None, help="run dir with ckpt/diffusion.pt + results.json: skip LBM check and training")
-    ap.add_argument("--n-lbm", type=int, default=20, help="LBM spot-check shapes (G13); 0 skips")
+    ap.add_argument("--n-lbm", "--lbm-check", dest="n_lbm", type=int, default=20, help="LBM spot-check shapes (G13); 0 skips")
     ap.add_argument("--n-targets", type=int, default=8)
     ap.add_argument("--n-per-target", type=int, default=8)
     ap.add_argument("--n-unguided", type=int, default=64)
@@ -235,32 +266,40 @@ def main(argv=None):
     gs, cs = (list(map(float, s.split(","))) for s in a.grid.split(":"))
     a.guide_scales, a.cfg_scales = gs, cs
 
-    cfg = load_config(None, a.tier, a.sets)
+    v2 = a.regime == "v2"
+    a.anchors = a.anchors or (V2_ANCHORS if v2 else ANCHORS)
+    ov = (_load("g02", "02_generate_lbm_dataset.py").V2_CASE + ["adjoint.mode=time_averaged"] if v2 else []) + a.sets  # user -o wins
+    cfg = load_config(None, a.tier, ov)
     seed_everything(cfg.seed)
     device = get_device(a.device)
-    out = Path(a.out or ROOT / f"runs/diffusion_{a.tier}")
+    out = Path(a.out or ROOT / (f"runs/diffusion_v2_{a.tier}" if v2 else f"runs/diffusion_{a.tier}"))
     (out / "fig").mkdir(parents=True, exist_ok=True)
     (out / "config.yaml").write_text(dump_config(cfg))
-    ck_path = a.pinn_ckpt or json.loads((ROOT / "runs/pinn_selected.json").read_text())["transformer"]["checkpoint"]
+    ck_path = a.pinn_ckpt or json.loads((ROOT / "runs/pinn_selected.json").read_text())["transformer_v2" if v2 else "transformer"]["checkpoint"]
     ck_path = Path(ck_path) if Path(ck_path).is_absolute() else ROOT / ck_path
     A = load_ckpt(ROOT / a.anchors if not Path(a.anchors).is_absolute() else a.anchors, "cpu")
     pinn, nurbs = _load("train03", "03_train_transformer_pinn.py").load_for_eval(ck_path, "transformer", device, A)
-    ref = NURBSAirfoil(k=8, dtype=torch.float64)
-    res = {"device_info": device_info(device), "tier": a.tier, "scope": "symmetric k=8, Re 20, AoA 0 only (PINN v1c range); "
-           "cambered / Re 1000 waits for PINN v2", "pinn_ckpt": str(ck_path), "overrides": a.sets}
+    ref = NURBSAirfoil(k=8, mode="cambered" if v2 else "symmetric", dtype=torch.float64)
+    res = {"device_info": device_info(device), "tier": a.tier, "regime": a.regime,
+           "scope": ("cambered k=8 (12 free entries), Re 1000, AoA {0, 10} deg per shape (PINN transformer_v2 range)" if v2
+                     else "symmetric k=8, Re 20, AoA 0 only (PINN v1c range)"), "pinn_ckpt": str(ck_path), "overrides": ov}
 
-    alpha, res["data"] = make_shapes(cfg, A, ref)
+    alpha, res["data"] = make_shapes(cfg, A, ref, a.regime)
     alpha = alpha.float().to(device)
-    cond = pinn_labels(pinn, nurbs, alpha).detach()
+    aoa_deg = None
+    if v2:
+        aoa_deg = torch.tensor(V2_AOA_DEG)[torch.randint(0, len(V2_AOA_DEG), (alpha.shape[0],), generator=torch.Generator().manual_seed(cfg.seed))]
+        res["data"]["n_aoa10"] = int((aoa_deg == 10).sum())
+    cond = pinn_labels(pinn, nurbs, alpha, aoa_deg, V2_RE if v2 else None).detach()
     free = nurbs.full_to_free(alpha)
     res["data"].update(cd_range=[float(cond[:, 1].min()), float(cond[:, 1].max())], cl_range=[float(cond[:, 0].min()), float(cond[:, 0].max())],
                        cl_abs_max=float(cond[:, 0].abs().max()))
     d = ROOT / "data/diffusion_shapes"
     d.mkdir(parents=True, exist_ok=True)
     torch.save({"alpha": alpha.cpu(), "cond": cond.cpu(), "label_source": "transformer_pinn",
-                "pinn_ckpt": hashlib.md5(ck_path.read_bytes()).hexdigest()}, d / f"{a.tier}_symmetric.pt")
+                "pinn_ckpt": hashlib.md5(ck_path.read_bytes()).hexdigest()}, d / f"{a.tier}_{'cambered' if v2 else 'symmetric'}.pt")
     prev = json.loads((Path(a.eval_from) / "results.json").read_text()) if a.eval_from else None
-    res["lbm_check"] = prev["lbm_check"] if prev else lbm_check(cfg, alpha, cond, nurbs, a.n_lbm)
+    res["lbm_check"] = prev["lbm_check"] if prev else lbm_check(cfg, alpha, cond, nurbs, a.n_lbm, a.regime)
     free_mps_cache(device)
     print("lbm_check:", {k: v for k, v in (res["lbm_check"] or {}).items() if not isinstance(v, list)}, flush=True)
 
@@ -286,17 +325,20 @@ def main(argv=None):
                        cfg_scale=dc.cfg_scale, guide_scale=0.0, guide_clip=dc.guide_clip, generator=torch.Generator().manual_seed(3)).alpha.detach()
     ho_tm = 1.15 * nurbs.thickness_at_ctrl(u).reshape(a.n_targets, a.n_per_target, -1).median(1).values
     ho_tm[:, [0, 1, -1]] = 0
-    # G35 set 2: CD 5-15% beyond the data range (CL = median), with the plain half-NACA0012 floor
+    # G35 set 2: CD 5-15% beyond the data range (CL = median), AoA 0, with the plain half-NACA0012 floor (v2: half-RAE2822)
     lo_hi = cond[:, 1].min(), cond[:, 1].max()
     cd_out = torch.stack([lo_hi[1] * 1.05, lo_hi[1] * 1.15, lo_hi[0] * 0.95, lo_hi[0] * 0.85])
-    base_tm = 0.5 * torch.relu(nurbs.thickness_at_ctrl(naca4_alpha(ref, "0012").reshape(1, -1).float().to(device)))
+    floor = (rae2822_alpha(ref) if v2 else naca4_alpha(ref, "0012")).reshape(1, -1).float().to(device)
+    base_tm = 0.5 * torch.relu(nurbs.thickness_at_ctrl(floor))
     base_tm[:, [0, 1, -1]] = 0
-    out_t = torch.stack([cond[:, 0].median().expand(4), cd_out, cond[0, 2].expand(4), cond[0, 3].expand(4)], 1)
+    out_t = torch.stack([cond[:, 0].median().expand(4), cd_out, cond[0, 2].expand(4), torch.zeros(4, device=device)], 1)
     sets = {"heldout_tmin": (ho_t, ho_tm), "beyond_range": (out_t, base_tm.expand(4, -1))}
     rows, keep, res["unguided"], al_u = evaluate(cfg, a, sampler, nurbs, ref, sets, alpha[tr].cpu().double(), device)
     res["targets"], res["sweep"] = {k: v[0].tolist() for k, v in sets.items()}, rows
     res["t_min_heldout"] = ho_tm.tolist()
     res["acceptance"] = {k: accept([r for r in rows if r["set"] == k], res["unguided"], dc) for k in sets}
+    ab = res["acceptance"]["beyond_range"]["best_pair"]  # G36: the benchmark's (guide, cfg) pair: best valid pair on the beyond-range targets
+    res["chosen_pair"] = ab or {"guide_scale": dc.guide_scale, "cfg_scale": dc.cfg_scale}
     res["data"]["thickness_range"] = [float(nurbs.thickness_at_ctrl(alpha).max(1).values.min()), float(nurbs.thickness_at_ctrl(alpha).max(1).values.max())]
     b = res["acceptance"]["heldout_tmin"]["best_pair"]
     plot_shapes(nurbs, {"train": alpha[tr], "unguided": al_u, **({"guided (best, heldout_tmin)": keep[("heldout_tmin", b["guide_scale"], b["cfg_scale"])]} if b else {})},

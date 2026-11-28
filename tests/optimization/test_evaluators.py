@@ -95,3 +95,48 @@ def test_pinn_evaluator_rejects_out_of_range_condition():  # L1
     for bad in (Condition(1000, 0), Condition(20, 10)):
         with pytest.raises(ValueError, match="training range"):
             ev.value(circle_alpha(n), bad)
+
+
+def test_build_evaluator_hybrid():
+    from aeroshape.optimization.evaluators import HybridEvaluator
+    n = NURBSAirfoil(k=8)
+    m = MLPPINN(8, hidden=16, layers=2, fourier=8)
+    ev = build_evaluator(CFG, "hybrid_mlp_pinn", n, 10, m)
+    assert isinstance(ev, HybridEvaluator) and isinstance(ev.grad_eval, PINNEvaluator) and isinstance(ev.value_eval, LBMScoreEvaluator)
+    assert isinstance(build_evaluator(CFG, "hybrid_transformer_pinn", n, 10, m), HybridEvaluator)
+
+
+@pytest.mark.parametrize("mode,warm", [("steady", True), ("time_averaged", False)])
+def test_adjoint_warm_start_only_in_steady(monkeypatch, mode, warm):
+    from types import SimpleNamespace
+    from aeroshape.optimization import evaluators as E
+    seen = []
+
+    def fake(alpha, nurbs, cond, cfg, weights, N, f0, F0):
+        seen.append(F0)
+        return SimpleNamespace(extras={"f": "f", "F_star": "F"})
+    monkeypatch.setattr(E.A, "lbm_value_and_grad", fake)
+    cfg = load_config(None, "smoke", ["adjoint.mode=" + mode])
+    ev = AdjointLBMEvaluator(cfg, None, N=10)
+    ev.evaluate(None, COND, W), ev.evaluate(None, COND, W)
+    assert seen == [None, "F" if warm else None]
+
+
+def test_fd_lbm_evaluator_matches_analytic(monkeypatch):
+    from aeroshape.optimization.evaluators import FDLBMEvaluator, combined
+    from aeroshape.lbm import adjoint_solver as A
+    n = NURBSAirfoil(k=8, dtype=torch.float64)
+    a = circle_alpha(n).reshape(-1)
+    w1, v1 = torch.randn(a.numel(), dtype=a.dtype), torch.randn(a.numel(), dtype=a.dtype)
+    fn = lambda x: ((w1 * x**2).sum(), (v1 * x).sum())
+    monkeypatch.setattr(A, "lbm_value", lambda x, *_: (*fn(x.reshape(-1)), None))
+    ev = build_evaluator(CFG, "fd_lbm", n, N=10)
+    assert isinstance(ev, FDLBMEvaluator)
+    r = ev.evaluate(a, COND, W)
+    x = a.clone().requires_grad_(True)
+    ref, = torch.autograd.grad(combined(*fn(x), W), x)
+    free = torch.zeros_like(a, dtype=torch.bool)
+    free[[int(i) for i in n.free_idx]] = True
+    assert r.wall_s >= r.extras["t_forward"] and r.extras["wall_s"] == r.wall_s
+    g = r.extras["dI_dalpha"]
+    assert torch.allclose(g[free], ref[free], atol=1e-6) and (g[~free] == 0).all()

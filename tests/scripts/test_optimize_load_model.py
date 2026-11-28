@@ -25,3 +25,19 @@ def test_geometry_mismatch_raises(tmp_path):  # L6
     save_ckpt(tmp_path / "c.pt", {"model": {}, "config": {**cfg.to_dict(), "geometry": {"k": cfg.geometry.k + 1, "degree": cfg.geometry.degree, "M": cfg.geometry.M}}})
     with pytest.raises(ValueError, match="geometry"):
         opt06.load_model(cfg, NURBSAirfoil(k=8), "mlp_pinn", tmp_path / "c.pt", "cpu")
+
+
+def test_hybrid_smoke_run(tmp_path):
+    import json
+    sel = ROOT / "runs/pinn_selected.json"
+    anchors = ROOT / "data/lbm_anchors/dev/merged.pt"
+    if not (sel.exists() and anchors.exists()):
+        pytest.skip("needs the selected transformer checkpoint and anchors")
+    ck = ROOT / json.loads(sel.read_text())["transformer"]["checkpoint"]
+    if not ck.exists():
+        pytest.skip("transformer checkpoint file absent")
+    opt06.main(["--case", str(ROOT / "configs/case1_circle_to_naca_re20.yaml"), "--evaluator", "hybrid_transformer_pinn", "--tier", "smoke",
+                "--device", "cpu", "--ckpt", str(ck), "--box-anchors", str(anchors), "--out", str(tmp_path),
+                "--set", "optimizer.max_cycles=1", "--set", "lbm.max_convective_times=3"])
+    res = json.loads((tmp_path / "results.json").read_text())
+    assert res["evaluator"] == "hybrid_transformer_pinn" and res["cycles"] == 1

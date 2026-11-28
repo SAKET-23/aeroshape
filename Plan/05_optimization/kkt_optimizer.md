@@ -32,10 +32,14 @@ class AugmentedLagrangianOptimizer:
 1. `res = evaluator.evaluate(alpha, cond, CostWeights(lam, rho_al, cl_ref))`.
 2. Thickness penalty and its gradient by autograd: `P = (mu/2) Σ relu(t_min − thickness_at_ctrl(alpha))²`.
 3. `g = res.grad_L + ∇P`, restricted to free entries (pinned entries zeroed); symmetric mode keeps symmetry automatically.
-4. Step: `alpha_trial = alpha − eta · g / max(1, eta · ‖g‖_∞ / g_cap)` — the largest control-point move is at most `g_cap` (default 0.02 chord per cycle), so the grid topology changes gradually. (Review H1: an earlier version divided by `‖g‖_∞ / g_cap` without `eta`, capping moves at `eta · g_cap = 0.001` chord — too small to ever reach the target shape.)
-5. **Backtracking**: evaluate `L` at `alpha_trial` (forward only for LBM, cheap for PINN); if it does not decrease, halve `eta` (up to 4 times). If still no decrease, accept the smallest step (flagged in the record); after `max_flagged` consecutive flagged cycles, stop with reason `stalled`.
-6. Multiplier updates: `lam ← lam + rho_al (CL − CL_ref)`; if max thickness violation > tol, `mu ← min(2 mu, mu_max)`.
-7. Record: `alpha`, CD, CL, `L`, violation, KKT residual (derivations 7.4), `eta`, wall-clock.
+4. Step: `alpha_trial = alpha − eta · g / max(1, eta · ‖g‖_∞ / cap)` with `cap = g_cap · cap_scale · backtrack^nb` (nb = backtracks so far), so the largest control-point move is at most `g_cap` (default 0.02 chord) on the first trial and strictly smaller on every retry. (Review H1: dividing by `‖g‖_∞ / g_cap` without `eta` capped moves at `eta · g_cap`. Later fix: with a fixed cap, a large gradient made every halving of `eta` give the same trial point.)
+5. **Backtracking**: evaluate `L` at `alpha_trial` (forward only for LBM, cheap for PINN); if it does not decrease, shrink `eta` and the cap by `backtrack` (up to 4 times). `cap_scale` (persistent, starts 1) multiplies by `backtrack^(nb+1)` after a flagged cycle (so the next cycle starts below the last trial) and doubles (max 1) after an accepted one. A non-finite gradient flags the cycle at once with no trial solves. If still no decrease, **do not move**: `alpha` stays, the evaluator warm start is restored to the solve at `alpha`, and the cycle is flagged. After `max_flagged` consecutive flagged cycles, stop with reason `stalled`. Accepted points therefore never have a higher `L`.
+6. Multiplier updates (CL taken at the accepted point, or at `alpha` if the step was rejected): `lam ← lam + clip(rho_al (CL − CL_ref), ±lam_step_max)` (config `optimizer.lam_step_max`, default 0.5); `mu ← min(2 mu, mu_max)` only if the max thickness violation > tol **and** it is not already shrinking (`viol > 0.75 ×` the previous cycle's; the first cycle has no previous one, so it doubles).
+7. Record: `alpha`, CD, CL, `L`, violation (of the cycle's start point; plus `alpha_new, cd_new, cl_new, viol_new, L_new` of the accepted trial, absent when rejected), KKT residual (derivations 7.4), `eta`, wall-clock.
+
+### Best shape
+
+`best_alpha` (also `history["best_alpha"]`) is the lowest-CD point (over every record's start point and accepted trial point) with violation < 1e-3 and (if `CL_ref` is set) `|CL − CL_ref| < cl_tol`; if none is feasible, the lexicographic minimum of (violation, `|CL − CL_ref|`, CD) (`L` is not comparable across cycles). `results.json` also has `best_feasible`, `best_cycle` (1-based) and `best_point` (`start`|`accepted`). It is derived from the records, so it survives checkpoint and resume. `scripts/06_optimize_case.py` projects the start shape onto the thickness floor (`project_thickness`, pinned ends unchanged), LBM re-scores and reports `best_alpha` (`alpha_final`), and stores the last iterate as `alpha_last`.
 
 ### Stopping
 

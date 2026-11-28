@@ -13,10 +13,52 @@ HAVE_MODELS = (ROOT / "runs/pinn_selected.json").exists() and (ROOT / "runs/diff
 MICRO = ["optimizer.max_cycles=1", "adjoint.tol=1.0e-3", "lbm.max_convective_times=3", "diffusion.sample_steps=4"]
 
 
-def test_cases_2_3_fail_clearly_until_wired():
-    ns = bench.argparse.Namespace(diffusion_ckpt="runs/diffusion_dev/ckpt/diffusion.pt")
-    with pytest.raises(SystemExit, match=r"needs PINN v2|v2 models are listed"):
-        bench.models_for(2, ns)
+def _fake_runs(tmp_path, monkeypatch, with_ckpt):
+    (tmp_path / "runs/pinn_selected.json").parent.mkdir(parents=True)
+    sel = {k: {"checkpoint": f"{k}.pt", "wall_s": i + 1.0} for i, k in enumerate(["mlp", "transformer", "mlp_v2", "transformer_v2"])}
+    (tmp_path / "runs/pinn_selected.json").write_text(json.dumps(sel))
+    d = tmp_path / "runs/diffusion_v2_dev"
+    (d / "ckpt").mkdir(parents=True)
+    (d / "results.json").write_text(json.dumps({"train": {"wall_s": 7.0}, "chosen_pair": {"guide_scale": 3.0, "cfg_scale": 0.0},
+                                              "acceptance": {"heldout_tmin": {"best_pair": {"guide_scale": 2.0, "cfg_scale": 1.0}}}}))
+    if with_ckpt:
+        (d / "ckpt/diffusion.pt").write_bytes(b"x")
+    monkeypatch.setattr(bench, "ROOT", tmp_path)
+
+
+def test_cases_2_3_use_v2_models(tmp_path, monkeypatch):
+    _fake_runs(tmp_path, monkeypatch, True)
+    m = bench.models_for(2, bench.argparse.Namespace(diffusion_ckpt="unused"))
+    assert m["mlp_pinn"].name == "mlp_v2.pt" and m["transformer_pinn"].name == "transformer_v2.pt"
+    assert m["diffusion"].parts[-3] == "diffusion_v2_dev" and m["train_s"] == {"mlp_pinn": 3.0, "transformer_pinn": 4.0, "diffusion_only": 7.0}
+    assert m["diffusion_pair"] == {"guide_scale": 3.0, "cfg_scale": 0.0}  # chosen_pair wins over the differing heldout_tmin pair
+    rj = tmp_path / "runs/diffusion_v2_dev/results.json"
+    res = json.loads(rj.read_text())
+    del res["chosen_pair"]
+    res["acceptance"]["beyond_range"] = {"best_pair": {"guide_scale": 0.5, "cfg_scale": 2.0}}
+    rj.write_text(json.dumps(res))
+    assert bench.models_for(2, bench.argparse.Namespace(diffusion_ckpt="unused"))["diffusion_pair"] == {"guide_scale": 0.5, "cfg_scale": 2.0}
+
+
+def test_cases_2_3_missing_diffusion_ckpt(tmp_path, monkeypatch):
+    _fake_runs(tmp_path, monkeypatch, False)
+    with pytest.raises(SystemExit, match=r"cambered diffusion checkpoint not found.*diffusion_v2_dev"):
+        bench.models_for(3, bench.argparse.Namespace(diffusion_ckpt="unused"))
+
+
+def test_box_dim_guard(tmp_path):
+    import torch
+    from aeroshape.core.config import load_config
+    f = tmp_path / "box8.pt"
+    torch.save({"alpha": torch.zeros(3, 8), "split": torch.zeros(3)}, f)
+    with pytest.raises(ValueError, match="D=16"):
+        bench.check_box_dim(str(f), load_config("case2_circle_to_rae_re1000.yaml", "smoke", []))
+    bench.check_box_dim(str(f), load_config("case1_circle_to_naca_re20.yaml", "smoke", []))  # symmetric D=8 passes
+
+
+def test_hybrid_flag_off_by_default():
+    assert bench.HYBRID not in bench.METHODS and bench.HYBRID in bench.RUNS
+    assert bench.RUNS[bench.HYBRID][1] == "pinn_train" and bench.up_front(bench.HYBRID, {"transformer_pinn": 5.0}) == 5.0
 
 
 def test_row_and_table():
@@ -52,3 +94,11 @@ def test_optimizer_config_values_are_numbers():  # '1.0e4' (no exponent sign) lo
     from aeroshape.core.config import load_config
     o = load_config(None, "smoke", []).optimizer.to_dict()
     assert all(isinstance(v, (int, float)) for k, v in o.items() if k not in ("evaluator", "box")), o
+
+
+def test_resume_args_for_partial_subrun(tmp_path):
+    assert bench.resume_args(True, tmp_path) == []  # nothing yet: fresh start
+    (tmp_path / "state.pt").write_bytes(b"x")
+    assert bench.resume_args(True, tmp_path) == ["--resume"] and bench.resume_args(False, tmp_path) == []
+    (tmp_path / "results.json").write_text("{}")
+    assert bench.resume_args(True, tmp_path) == []

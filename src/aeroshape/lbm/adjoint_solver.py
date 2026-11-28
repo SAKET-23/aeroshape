@@ -180,10 +180,14 @@ def _forward(g, p, cfg, mode="steady", f0=None):
     L = cfg.lbm
     g = replace(g, links=replace(g.links, q=g.links.q.detach()))
     dt, pert = g.links.q.dtype, L.perturb if mode != "steady" else 0.0
+    transient = L.transient if f0 is None else L.transient_warm  # warm start: wake already developed
     f0 = S.init_state(p, g, dt, perturb=pert) if f0 is None else f0 + (S.init_state(p, g, dt, perturb=pert) - S.init_state(p, g, dt))
     r = S.run(f0, g, p, force_fn=force_fn, mode="steady" if mode == "steady" else "unsteady", record_every=L.record_every,
               outlet=L.outlet, steady_tol=L.steady_tol, max_convective_times=L.max_convective_times,
-              average_periods=L.average_periods, transient=L.transient)
+              average_periods=L.average_periods, transient=transient,
+              **({} if mode == "steady" else {"window_convective_times": L.window_convective_times}),
+              compile=getattr(L, "compile", False), cuda_graph=getattr(L, "cuda_graph", False),
+              graph_steps=getattr(L, "graph_steps", 49))
     if mode != "steady" and r.f_mean is not None:
         return g, r.f_mean, r.cd, r.cl, r.state.f, r.converged
     fn, fc = S.step(r.state.f, g, p, L.outlet)
